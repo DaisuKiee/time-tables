@@ -1,5 +1,6 @@
 """
 Script to extract text content from Word (.docx) files
+asdasdas
 """
 import sys
 
@@ -49,3 +50,8 @@ if __name__ == "__main__":
     file_path = sys.argv[1]
     content = read_docx(file_path)
     print(content)
+
+
+
+
+
