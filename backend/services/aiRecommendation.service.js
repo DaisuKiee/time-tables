@@ -12,6 +12,7 @@
 const axios = require('axios');
 const Faculty = require('../models/Faculty.model');
 const Subject = require('../models/Subject.model');
+const { summarizeSubjectExperience } = require('../utils/teachingExperience');
 
 // AI Provider configurations
 const AI_PROVIDERS = {
@@ -153,19 +154,23 @@ function calculateFacultyScore(faculty, subject) {
   breakdown.specialization = specializationScore;
   total += specializationScore;
 
-  // 2. Teaching History (0-30 points)
-  const relevantHistory = faculty.teachingHistory.filter(h =>
-    h.subjectCode === subject.subjectCode ||
-    h.subjectName.toLowerCase().includes(subject.subjectName.toLowerCase())
-  );
-  
-  let historyScore = relevantHistory.length * 10;
-  if (relevantHistory.length > 0) {
-    const avgRating = relevantHistory.reduce((sum, h) => sum + (h.rating || 0), 0) / relevantHistory.length;
-    historyScore += avgRating * 2; // Bonus for good ratings
+  // 2. Teaching History (0-30 points), weighted by RECENCY.
+  // Teaching a subject last year counts far more than teaching it 5 years ago,
+  // so we score the recency-weighted occurrence count rather than a raw count.
+  const exp = summarizeSubjectExperience(faculty, subject);
+
+  let historyScore = exp.weightedExperience * 10;
+  if (exp.avgRating) {
+    historyScore += exp.avgRating * 2; // Bonus for good ratings on this subject
   }
   historyScore = Math.min(historyScore, 30);
-  breakdown.history = historyScore;
+  breakdown.history = Math.round(historyScore * 10) / 10;
+  breakdown.historyDetail = {
+    timesTaught: exp.timesTaught,
+    lastTaughtAcademicYear: exp.lastTaughtAcademicYear,
+    lastTaughtYearsAgo: exp.lastTaughtYearsAgo,
+    isStale: exp.isStale,
+  };
   total += historyScore;
 
   // 3. Workload Balance (0-20 points)

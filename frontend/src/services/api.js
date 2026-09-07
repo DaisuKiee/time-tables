@@ -67,7 +67,9 @@ export const authAPI = {
   changePassword: (data) => api.put('/auth/change-password', data),
   getSettings: () => api.get('/auth/settings'),
   updateSettings: (data) => api.put('/auth/settings', data),
-  logout: () => api.post('/auth/logout')
+  logout: () => api.post('/auth/logout'),
+  forgotPassword: (data) => api.post('/auth/forgot-password', data),
+  resetPassword: (token, data) => api.post(`/auth/reset-password/${token}`, data)
 };
 
 // ============== USER ENDPOINTS ==============
@@ -146,21 +148,47 @@ export const roomAPI = {
   getStats: () => api.get('/rooms/stats')
 };
 
+// ============== PROGRAM ENDPOINTS ==============
+export const programAPI = {
+  getAll: (params) => api.get('/programs', { params }),
+  getById: (id) => api.get(`/programs/${id}`),
+  create: (data) => api.post('/programs', data),
+  update: (id, data) => api.put(`/programs/${id}`, data),
+  delete: (id) => api.delete(`/programs/${id}`)
+};
+
+/**
+ * Client timeout for a solver-backed request: the solver's own budget plus
+ * headroom for data loading, the Python process and JSON transfer.
+ */
+const solverTimeout = (data) => {
+  const limit = Number(data?.timeLimit) || 60;
+  return (limit + 45) * 1000;
+};
+
 // ============== SCHEDULE ENDPOINTS ==============
 export const scheduleAPI = {
   getAll: (params) => api.get('/schedules', { params }),
   getById: (id) => api.get(`/schedules/${id}`),
   create: (data) => api.post('/schedules', data),
+  // Validates the whole batch and writes all-or-nothing, so a partial failure
+  // can't leave some rows saved while the client still holds them as pending.
+  bulkCreate: (schedules) => api.post('/schedules/bulk', { schedules }),
   update: (id, data) => api.put(`/schedules/${id}`, data),
   delete: (id) => api.delete(`/schedules/${id}`),
+  batchDelete: (ids) => api.post('/schedules/batch-delete', { ids }),
   getByProgramAndYear: (program, year, params) => 
     api.get(`/schedules/program/${program}/year/${year}`, { params }),
   getFacultySchedule: (facultyId, params) => 
     api.get(`/schedules/faculty/${facultyId}`, { params }),
   checkConflicts: (data) => api.post('/schedules/check-conflicts', data),
   publish: (data) => api.post('/schedules/publish', data),
-  generate: (data) => api.post('/schedules/generate', data),
-  preview: (data) => api.post('/schedules/preview', data),
+  // Schedule generation runs a constraint solver server-side for up to
+  // `timeLimit` seconds, so the client has to wait longer than the 30s default
+  // or the request is aborted before the solver can possibly answer
+  // ("timeout of 30000ms exceeded" with the default 60s limit).
+  generate: (data) => api.post('/schedules/generate', data, { timeout: solverTimeout(data) }),
+  preview: (data) => api.post('/schedules/preview', data, { timeout: solverTimeout(data) }),
   savePreview: (data) => api.post('/schedules/save-preview', data),
   checkORToolsStatus: () => api.get('/schedules/ortools-status')
 };
@@ -197,31 +225,40 @@ export const importAPI = {
 export const classSpaceAPI = {
   getAll: (params) => api.get('/classSpaces', { params }),
   getById: (id) => api.get(`/classSpaces/${id}`),
-  getByCode: (code) => api.get(`/classSpaces/code/${code}`),
   getMyClasses: () => api.get('/classSpaces/my-classes'),
   create: (data) => api.post('/classSpaces', data),
   update: (id, data) => api.put(`/classSpaces/${id}`, data),
   delete: (id) => api.delete(`/classSpaces/${id}`),
-  
+  regenerateClassCode: (id) => api.put(`/classSpaces/${id}/regenerate-code`),
+
   // Announcements
   postAnnouncement: (id, data) => api.post(`/classSpaces/${id}/announcements`, data),
-  updateAnnouncement: (id, announcementId, data) => 
+  updateAnnouncement: (id, announcementId, data) =>
     api.put(`/classSpaces/${id}/announcements/${announcementId}`, data),
-  deleteAnnouncement: (id, announcementId) => 
+  deleteAnnouncement: (id, announcementId) =>
     api.delete(`/classSpaces/${id}/announcements/${announcementId}`),
-  
+
   // Materials
-  uploadMaterial: (id, formData) => 
+  uploadMaterial: (id, formData) =>
     api.post(`/classSpaces/${id}/materials`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' }
     }),
-  deleteMaterial: (id, materialId) => 
+  deleteMaterial: (id, materialId) =>
     api.delete(`/classSpaces/${id}/materials/${materialId}`),
-  
-  // Enrollment
-  enroll: (id, data) => api.post(`/classSpaces/${id}/enroll`, data),
-  unenroll: (id) => api.post(`/classSpaces/${id}/unenroll`),
-  enrollByCode: (enrollmentCode) => api.post('/classSpaces/enroll-by-code', { enrollmentCode })
+
+  // Enrollment.
+  // Regular students pass a SECTION enrollment code; irregular students pass a
+  // SUBJECT class code. The backend routes on the student's studentType.
+  join: (code) => api.post('/classSpaces/join', { code }),
+  leave: (id) => api.post(`/classSpaces/${id}/leave`)
+};
+
+/** Absolute URL for an uploaded material. */
+export const resolveUploadUrl = (fileUrl) => {
+  if (!fileUrl) return '';
+  if (/^https?:\/\//i.test(fileUrl)) return fileUrl;
+  // API_URL ends with /api; uploads are served from the server root.
+  return `${API_URL.replace(/\/api\/?$/, '')}${fileUrl}`;
 };
 
 // ============== SECTION ENDPOINTS ==============

@@ -2,13 +2,14 @@ import { useState, useEffect } from 'react';
 import { subjectAPI } from '../services/api';
 import toast from 'react-hot-toast';
 import { X, BookOpen, GraduationCap, Layers, CheckSquare } from 'lucide-react';
+import { usePrograms } from '../hooks/usePrograms';
 
-const PROGRAMS = ['BSIT', 'BSHM', 'BIT-ET', 'BIT-CT', 'BIT-AT', 'BSFI', 'BSIE'];
 const SEMESTERS = [1, 2];
 const YEAR_LEVELS = [1, 2, 3, 4];
 const SUBJECT_TYPES = ['Lecture', 'Laboratory', 'Both'];
 
 const SubjectModal = ({ mode, subject, onClose }) => {
+  const { programCodes: PROGRAMS } = usePrograms();
   const [loading, setLoading] = useState(false);
   const [subjects, setSubjects] = useState([]);
   const [formData, setFormData] = useState({

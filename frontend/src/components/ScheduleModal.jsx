@@ -2,11 +2,12 @@ import { useState, useEffect } from 'react';
 import { scheduleAPI, facultyAPI, subjectAPI, roomAPI } from '../services/api';
 import toast from 'react-hot-toast';
 import { X, Plus, Trash2 } from 'lucide-react';
+import { usePrograms } from '../hooks/usePrograms';
 
 const DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
-const PROGRAMS = ['BSIT', 'BSHM', 'BIT-ET', 'BIT-CT', 'BIT-AT', 'BSFI', 'BSIE'];
 
 const ScheduleModal = ({ mode, schedule, subjects: propSubjects, sections: propSections, faculty: propFaculty, rooms: propRooms, onClose, onDelete }) => {
+  const { programCodes: PROGRAMS } = usePrograms();
   const [loading, setLoading] = useState(false);
   const [subjects, setSubjects] = useState([]);
   const [faculty, setFaculty] = useState([]);

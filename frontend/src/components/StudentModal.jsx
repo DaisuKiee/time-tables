@@ -2,8 +2,10 @@ import React, { useState, useEffect } from 'react';
 import { studentAPI, sectionAPI } from '../services/api';
 import toast from 'react-hot-toast';
 import { X, Users, Mail, Lock, User, GraduationCap, Phone, MapPin, UserCheck, Save, FileText } from 'lucide-react';
+import { usePrograms } from '../hooks/usePrograms';
 
 const StudentModal = ({ student, onClose }) => {
+  const { programCodes } = usePrograms();
   const [formData, setFormData] = useState({
     email: '',
     password: '',
@@ -359,13 +361,9 @@ const StudentModal = ({ student, onClose }) => {
                     className="w-full px-4 py-2.5 border-2 border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 dark:text-white transition-all"
                     required
                   >
-                    <option value="BSIT">BSIT</option>
-                    <option value="BSHM">BSHM</option>
-                    <option value="BIT-ET">BIT-ET</option>
-                    <option value="BIT-CT">BIT-CT</option>
-                    <option value="BIT-AT">BIT-AT</option>
-                    <option value="BSFI">BSFI</option>
-                    <option value="BSIE">BSIE</option>
+                    {programCodes.map(prog => (
+                      <option key={prog} value={prog}>{prog}</option>
+                    ))}
                   </select>
                 </div>
                 <div>

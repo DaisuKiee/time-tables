@@ -1,17 +1,48 @@
 import React, { useState, useEffect } from 'react';
 import Layout from '../components/Layout';
-import { classSpaceAPI } from '../services/api';
+import { classSpaceAPI, resolveUploadUrl } from '../services/api';
 import { useAuth } from '../context/AuthContext';
 import toast from 'react-hot-toast';
 import {
   BookOpen, Bell, FileText, Users, Plus, Upload,
   UserPlus, Search, Download, Trash2, Pin,
-  User, X, Edit2, ChevronLeft,
-  TrendingUp, MessageSquare, MoreVertical, FolderOpen, Image
+  User, X, Edit2, ChevronLeft, Copy, RefreshCw,
+  TrendingUp, MessageSquare, FolderOpen, Clock, MapPin, LogOut
 } from 'lucide-react';
 import CreateAnnouncementModal from '../components/CreateAnnouncementModal';
 import UploadMaterialModal from '../components/UploadMaterialModal';
 import EnrollModal from '../components/EnrollModal';
+
+/* Fields are denormalised onto the ClassSpace, so read subject/faculty/section
+   directly and fall back to the populated schedule only for time/room. */
+const subjectCodeOf = (cs) => cs?.subject?.subjectCode || cs?.sectionCode || 'Class';
+const subjectNameOf = (cs) => cs?.subject?.subjectName || '';
+const facultyNameOf = (cs) => {
+  const u = cs?.faculty?.user;
+  return u ? `${u.firstName || ''} ${u.lastName || ''}`.trim() : null;
+};
+const timeSlotsOf = (cs) => cs?.schedule?.timeSlots || [];
+
+/**
+ * One-line summary of when a class meets.
+ *
+ * A class holds every meeting time for the subject, so showing only the first
+ * one ("Monday 08:00-09:00 +2") hid the days that matter most at a glance.
+ */
+const summariseSlots = (slots) => {
+  if (slots.length === 1) {
+    const s = slots[0];
+    return `${s.day.slice(0, 3)} ${s.startTime}-${s.endTime}`;
+  }
+  const days = [...new Set(slots.map((s) => s.day.slice(0, 3)))].join(', ');
+  return `${days} · ${slots.length} meetings`;
+};
+const fmtSize = (bytes) => {
+  if (!bytes) return '';
+  return bytes < 1024 * 1024
+    ? `${(bytes / 1024).toFixed(1)} KB`
+    : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+};
 
 // Card header colors — cycles through for variety like Google Classroom
 const CARD_COLORS = [
@@ -39,13 +70,16 @@ const ClassSpacePage = () => {
   const [showEnrollModal, setShowEnrollModal] = useState(false);
   const [editingAnnouncement, setEditingAnnouncement] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
+  // Whether the server says the current user may post in the open class
+  const [canPostHere, setCanPostHere] = useState(false);
+  const [studentType, setStudentType] = useState('regular');
+  const [joinHint, setJoinHint] = useState(null);
 
   const isFaculty = user?.role === 'faculty';
   const isStudent = user?.role === 'student';
   const isAdmin = user?.role === 'admin' || user?.role === 'scheduling_officer';
   const isManager = user?.role === 'program_manager';
-  const isManagerOrAdmin = isAdmin || isManager;
-  const canManage = isFaculty || isManagerOrAdmin;
+  const isIrregular = isStudent && studentType === 'irregular';
 
   useEffect(() => {
     loadClassSpaces();
@@ -54,23 +88,39 @@ const ClassSpacePage = () => {
   const loadClassSpaces = async () => {
     try {
       setLoading(true);
-      const response = isStudent
-        ? await classSpaceAPI.getMyClasses()
-        : await classSpaceAPI.getAll();
+      // Everyone uses /my-classes: it resolves per role on the server.
+      // Students are never allowed to list all class spaces.
+      const response = await classSpaceAPI.getMyClasses();
+      const payload = response.data;
 
-      // enrolled: false means student exists but has no sectionCode yet
-      if (response.data.enrolled === false) {
+      if (payload.studentType) setStudentType(payload.studentType);
+
+      if (payload.enrolled === false) {
         setNotEnrolled(true);
+        setJoinHint(payload.message || null);
         setClassSpaces([]);
       } else {
         setNotEnrolled(false);
-        setClassSpaces(response.data.data || []);
+        setJoinHint(null);
+        setClassSpaces(payload.data || []);
       }
     } catch (error) {
       console.error('Load class spaces error:', error);
-      toast.error('Failed to load classes');
+      toast.error(error.response?.data?.message || 'Failed to load classes');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const openClass = async (cs) => {
+    setActiveTab('stream');
+    try {
+      // Fetch the full record: the list response omits announcements/materials
+      const response = await classSpaceAPI.getById(cs._id);
+      setSelectedClass(response.data.data);
+      setCanPostHere(!!response.data.canPost);
+    } catch (error) {
+      toast.error(error.response?.data?.message || 'Could not open this class');
     }
   };
 
@@ -80,9 +130,38 @@ const ClassSpacePage = () => {
       const response = await classSpaceAPI.getById(selectedClass._id);
       const updated = response.data.data;
       setSelectedClass(updated);
-      setClassSpaces(prev => prev.map(cs => cs._id === updated._id ? updated : cs));
+      setCanPostHere(!!response.data.canPost);
+      setClassSpaces(prev => prev.map(cs => (cs._id === updated._id ? { ...cs, ...updated } : cs)));
     } catch (error) {
       console.error('Refresh class error:', error);
+    }
+  };
+
+  const handleCopyCode = (code) => {
+    navigator.clipboard?.writeText(code);
+    toast.success(`Class code ${code} copied`);
+  };
+
+  const handleRegenerateCode = async () => {
+    if (!window.confirm('Generate a new class code? The old code stops working.')) return;
+    try {
+      const response = await classSpaceAPI.regenerateClassCode(selectedClass._id);
+      setSelectedClass(prev => ({ ...prev, classCode: response.data.data.classCode }));
+      toast.success('New class code generated');
+    } catch (error) {
+      toast.error(error.response?.data?.message || 'Could not regenerate code');
+    }
+  };
+
+  const handleLeaveClass = async () => {
+    if (!window.confirm('Leave this subject? You will lose access to its posts.')) return;
+    try {
+      await classSpaceAPI.leave(selectedClass._id);
+      toast.success('Left the class');
+      setSelectedClass(null);
+      loadClassSpaces();
+    } catch (error) {
+      toast.error(error.response?.data?.message || 'Could not leave this class');
     }
   };
 
@@ -120,9 +199,10 @@ const ClassSpacePage = () => {
   const filteredClasses = classSpaces.filter(cs => {
     const q = searchTerm.toLowerCase();
     return (
-      (cs.schedule?.subject?.subjectCode || '').toLowerCase().includes(q) ||
-      (cs.schedule?.subject?.subjectName || '').toLowerCase().includes(q) ||
-      (cs.sectionCode || '').toLowerCase().includes(q)
+      subjectCodeOf(cs).toLowerCase().includes(q) ||
+      subjectNameOf(cs).toLowerCase().includes(q) ||
+      (cs.sectionCode || '').toLowerCase().includes(q) ||
+      (facultyNameOf(cs) || '').toLowerCase().includes(q)
     );
   });
 
@@ -135,7 +215,9 @@ const ClassSpacePage = () => {
     : [];
 
   const sortedMaterials = selectedClass?.materials
-    ? [...selectedClass.materials].sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt))
+    ? [...selectedClass.materials].sort(
+        (a, b) => new Date(b.createdAt || b.uploadedAt) - new Date(a.createdAt || a.uploadedAt)
+      )
     : [];
 
   const streamItems = [];
@@ -144,7 +226,11 @@ const ClassSpacePage = () => {
       streamItems.push({ type: 'announcement', data: ann, timestamp: new Date(ann.createdAt) })
     );
     sortedMaterials.forEach(mat =>
-      streamItems.push({ type: 'material', data: mat, timestamp: new Date(mat.uploadedAt) })
+      streamItems.push({
+        type: 'material',
+        data: mat,
+        timestamp: new Date(mat.createdAt || mat.uploadedAt),
+      })
     );
     streamItems.sort((a, b) => b.timestamp - a.timestamp);
   }
@@ -165,39 +251,89 @@ const ClassSpacePage = () => {
 
   // ─── Detail view (class selected) ─────────────────────────────────────────
   if (selectedClass) {
-    const colorIndex = classSpaces.indexOf(selectedClass) % CARD_COLORS.length;
-    const headerColor = CARD_COLORS[colorIndex];
-    const subjectCode = selectedClass.schedule?.subject?.subjectCode || selectedClass.sectionCode;
-    const subjectName = selectedClass.schedule?.subject?.subjectName || '';
-    const facultyName = selectedClass.schedule?.faculty?.user
-      ? `${selectedClass.schedule.faculty.user.firstName} ${selectedClass.schedule.faculty.user.lastName}`
-      : null;
+    const idx = classSpaces.findIndex(cs => cs._id === selectedClass._id);
+    const headerColor = CARD_COLORS[(idx < 0 ? 0 : idx) % CARD_COLORS.length];
+    const subjectCode = subjectCodeOf(selectedClass);
+    const subjectName = subjectNameOf(selectedClass);
+    const facultyName = facultyNameOf(selectedClass);
+    const canManage = canPostHere;
+    const slots = timeSlotsOf(selectedClass);
+    // Students receive enrolledCount instead of the roster
+    const studentCount =
+      selectedClass.enrolledStudents?.length ?? selectedClass.enrolledCount ?? 0;
 
     return (
       <Layout>
         <div className="min-h-screen bg-gray-100 dark:bg-gray-900">
           {/* Top bar */}
-          <div className="bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 px-6 py-3 flex items-center gap-4">
+          <div className="bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 px-4 sm:px-6 py-3 flex items-center gap-2 sm:gap-4">
             <button
               onClick={() => { setSelectedClass(null); setActiveTab('stream'); }}
-              className="flex items-center gap-2 text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white transition-colors"
+              className="flex items-center gap-1 sm:gap-2 flex-shrink-0 text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white transition-colors"
             >
-              <ChevronLeft className="w-5 h-5" />
-              <span className="font-medium">All Classes</span>
+              <ChevronLeft className="w-5 h-5 flex-shrink-0" />
+              {/* "All Classes" is redundant next to the back chevron on mobile */}
+              <span className="font-medium hidden sm:inline">All Classes</span>
+              <span className="font-medium sm:hidden">Back</span>
             </button>
-            <div className="text-gray-300 dark:text-gray-600">|</div>
-            <span className="font-semibold text-gray-900 dark:text-white">{subjectCode}</span>
+            <div className="text-gray-300 dark:text-gray-600 flex-shrink-0">|</div>
+            <span className="font-semibold text-gray-900 dark:text-white truncate">{subjectCode}</span>
           </div>
 
-          <div className="max-w-5xl mx-auto px-4 py-6 space-y-4">
+          <div className="max-w-5xl mx-auto px-4 py-4 sm:py-6 space-y-4">
             {/* Class header banner */}
-            <div className={`${headerColor} rounded-2xl p-8 text-white relative overflow-hidden`}>
+            <div className={`${headerColor} rounded-2xl p-5 sm:p-8 text-white relative overflow-hidden`}>
               <div className="relative z-10">
                 <p className="text-sm font-medium opacity-80 mb-1">{selectedClass.sectionCode}</p>
-                <h1 className="text-3xl font-bold mb-1">{subjectCode}</h1>
-                {subjectName && <p className="text-lg opacity-90">{subjectName}</p>}
-                {facultyName && (
-                  <p className="text-sm opacity-75 mt-2">{facultyName}</p>
+                <h1 className="text-2xl sm:text-3xl font-bold mb-1 break-words">{subjectCode}</h1>
+                {subjectName && <p className="text-base sm:text-lg opacity-90">{subjectName}</p>}
+                {facultyName && <p className="text-sm opacity-75 mt-2">{facultyName}</p>}
+
+                {/* Meeting times come from the linked schedule */}
+                {slots.length > 0 && (
+                  <div className="flex flex-wrap gap-2 mt-3">
+                    {slots.map((s, i) => (
+                      <span
+                        key={i}
+                        className="inline-flex items-center gap-1 px-2 py-1 bg-white/20 rounded-md text-xs"
+                      >
+                        <Clock className="w-3 h-3" />
+                        {s.day} {s.startTime}-{s.endTime}
+                      </span>
+                    ))}
+                    {selectedClass.schedule?.roomLabel && (
+                      <span className="inline-flex items-center gap-1 px-2 py-1 bg-white/20 rounded-md text-xs">
+                        <MapPin className="w-3 h-3" />
+                        {selectedClass.schedule.roomLabel}
+                      </span>
+                    )}
+                  </div>
+                )}
+
+                {/* Join code: only staff and the teacher ever receive it */}
+                {selectedClass.classCode && (
+                  <div className="flex items-center gap-2 mt-4">
+                    <span className="text-xs opacity-75">Subject class code</span>
+                    <code className="px-2 py-1 bg-white/20 rounded font-mono text-sm tracking-widest">
+                      {selectedClass.classCode}
+                    </code>
+                    <button
+                      onClick={() => handleCopyCode(selectedClass.classCode)}
+                      title="Copy code"
+                      className="p-1 hover:bg-white/20 rounded transition-colors"
+                    >
+                      <Copy className="w-3.5 h-3.5" />
+                    </button>
+                    {canManage && (
+                      <button
+                        onClick={handleRegenerateCode}
+                        title="Generate a new code"
+                        className="p-1 hover:bg-white/20 rounded transition-colors"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
                 )}
               </div>
               <div className="absolute right-6 bottom-6 opacity-10">
@@ -205,50 +341,63 @@ const ClassSpacePage = () => {
               </div>
             </div>
 
+            {/* Irregular students joined this one subject and may drop it */}
+            {isIrregular && (
+              <div className="flex justify-end">
+                <button
+                  onClick={handleLeaveClass}
+                  className="inline-flex items-center gap-2 px-3 py-2 text-sm text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg font-medium transition-colors"
+                >
+                  <LogOut className="w-4 h-4" />
+                  Leave this subject
+                </button>
+              </div>
+            )}
+
             {/* Tabs */}
             <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-sm overflow-hidden">
               <div className="flex border-b border-gray-200 dark:border-gray-700">
                 {[
                   { key: 'stream', label: 'Stream', icon: TrendingUp, count: streamItems.length },
                   { key: 'materials', label: 'Classwork', icon: FileText, count: sortedMaterials.length },
-                  { key: 'people', label: 'People', icon: Users, count: selectedClass.enrolledStudents?.length || 0 },
+                  { key: 'people', label: 'People', icon: Users, count: studentCount },
                 ].map(tab => (
                   <button
                     key={tab.key}
                     onClick={() => setActiveTab(tab.key)}
-                    className={`flex-1 flex items-center justify-center gap-2 px-4 py-4 font-medium text-sm transition-all ${
+                    className={`flex-1 flex items-center justify-center gap-1.5 sm:gap-2 px-2 sm:px-4 py-3 sm:py-4 font-medium text-xs sm:text-sm transition-all ${
                       activeTab === tab.key
                         ? 'text-blue-600 border-b-2 border-blue-600 bg-blue-50 dark:bg-blue-900/20 dark:text-blue-400'
                         : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700'
                     }`}
                   >
-                    <tab.icon className="w-4 h-4" />
-                    {tab.label}
-                    <span className="px-1.5 py-0.5 bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-300 rounded-full text-xs">
+                    <tab.icon className="w-4 h-4 flex-shrink-0" />
+                    <span className="truncate">{tab.label}</span>
+                    <span className="px-1.5 py-0.5 bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-300 rounded-full text-[11px] flex-shrink-0">
                       {tab.count}
                     </span>
                   </button>
                 ))}
               </div>
 
-              <div className="p-6">
+              <div className="p-4 sm:p-6">
                 {/* ── Stream Tab ── */}
                 {activeTab === 'stream' && (
                   <div className="space-y-4">
                     {canManage && (
-                      <div className="flex gap-3">
+                      <div className="flex flex-col sm:flex-row gap-2 sm:gap-3">
                         <button
                           onClick={() => { setEditingAnnouncement(null); setShowAnnouncementModal(true); }}
                           className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-medium transition-all"
                         >
-                          <MessageSquare className="w-5 h-5" />
+                          <MessageSquare className="w-5 h-5 flex-shrink-0" />
                           Announce
                         </button>
                         <button
                           onClick={() => setShowMaterialModal(true)}
                           className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-green-600 hover:bg-green-700 text-white rounded-xl font-medium transition-all"
                         >
-                          <Upload className="w-5 h-5" />
+                          <Upload className="w-5 h-5 flex-shrink-0" />
                           Upload Material
                         </button>
                       </div>
@@ -304,17 +453,24 @@ const ClassSpacePage = () => {
                               </div>
                               <div className="flex-1">
                                 <div className="text-xs text-gray-500 mb-1">
-                                  Material · {new Date(item.data.uploadedAt).toLocaleDateString()}
+                                  Material · {new Date(item.data.createdAt || item.data.uploadedAt).toLocaleDateString()}
                                 </div>
                                 <p className="font-semibold text-gray-900 dark:text-white mb-1">{item.data.title}</p>
                                 {item.data.description && (
                                   <p className="text-sm text-gray-500 mb-2">{item.data.description}</p>
                                 )}
                                 <div className="flex items-center gap-3">
-                                  <a href={item.data.fileUrl} download className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-green-600 hover:bg-green-700 text-white text-sm rounded-lg transition-colors">
+                                  {/* Absolute URL: uploads are served by the API, not the frontend origin */}
+                                  <a
+                                    href={resolveUploadUrl(item.data.fileUrl)}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    download={item.data.fileName}
+                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-green-600 hover:bg-green-700 text-white text-sm rounded-lg transition-colors"
+                                  >
                                     <Download className="w-3.5 h-3.5" /> Download
                                   </a>
-                                  <span className="text-xs text-gray-400">{(item.data.fileSize / 1024).toFixed(1)} KB</span>
+                                  <span className="text-xs text-gray-400">{fmtSize(item.data.fileSize)}</span>
                                   {canManage && (
                                     <button onClick={() => handleDeleteMaterial(item.data._id)} className="ml-auto p-1.5 text-gray-400 hover:text-red-600 rounded transition-colors">
                                       <Trash2 className="w-4 h-4" />
@@ -355,10 +511,18 @@ const ClassSpacePage = () => {
                             </div>
                             <div className="flex-1">
                               <p className="font-medium text-gray-900 dark:text-white">{mat.title}</p>
-                              <p className="text-xs text-gray-500">{(mat.fileSize / 1024).toFixed(1)} KB · {new Date(mat.uploadedAt).toLocaleDateString()}</p>
+                              <p className="text-xs text-gray-500">
+                                {fmtSize(mat.fileSize)} · {new Date(mat.createdAt || mat.uploadedAt).toLocaleDateString()}
+                              </p>
                             </div>
                             <div className="flex items-center gap-2">
-                              <a href={mat.fileUrl} download className="p-2 text-green-600 hover:bg-green-50 dark:hover:bg-green-900 rounded-lg transition-colors">
+                              <a
+                                href={resolveUploadUrl(mat.fileUrl)}
+                                target="_blank"
+                                rel="noreferrer"
+                                download={mat.fileName}
+                                className="p-2 text-green-600 hover:bg-green-50 dark:hover:bg-green-900 rounded-lg transition-colors"
+                              >
                                 <Download className="w-4 h-4" />
                               </a>
                               {canManage && (
@@ -384,23 +548,31 @@ const ClassSpacePage = () => {
                         <div className="flex items-center gap-3 p-3 rounded-xl bg-blue-50 dark:bg-blue-900/20">
                           <div className="w-10 h-10 bg-blue-600 rounded-full flex items-center justify-center">
                             <span className="text-white font-bold text-sm">
-                              {selectedClass.schedule.faculty.user.firstName?.[0]}
+                              {facultyName[0]}
                             </span>
                           </div>
                           <div>
                             <p className="font-semibold text-gray-900 dark:text-white">{facultyName}</p>
-                            <p className="text-xs text-gray-500">Instructor</p>
+                            <p className="text-xs text-gray-500">
+                              {selectedClass.faculty?.employeeId || 'Instructor'}
+                            </p>
                           </div>
                         </div>
                       </div>
                     )}
 
-                    {/* Students */}
+                    {/* Students. The server withholds the roster from students,
+                        sending only a count, so respect that here. */}
                     <div>
                       <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">
-                        Students ({selectedClass.enrolledStudents?.length || 0})
+                        Students ({studentCount})
                       </h3>
-                      {(selectedClass.enrolledStudents?.length || 0) === 0 ? (
+
+                      {!selectedClass.enrolledStudents ? (
+                        <p className="text-gray-500 text-sm">
+                          {studentCount} {studentCount === 1 ? 'classmate' : 'classmates'} in this class.
+                        </p>
+                      ) : selectedClass.enrolledStudents.length === 0 ? (
                         <div className="text-center py-8">
                           <Users className="w-10 h-10 text-gray-300 mx-auto mb-2" />
                           <p className="text-gray-500 text-sm">No students enrolled yet</p>
@@ -408,19 +580,28 @@ const ClassSpacePage = () => {
                       ) : (
                         <div className="space-y-2">
                           {selectedClass.enrolledStudents.map((enr, i) => {
-                            const s = enr.student || enr;
-                            const firstName = s?.firstName || '?';
-                            const lastName = s?.lastName || '';
+                            // enrolledStudents[].student is a Student doc whose
+                            // name lives on the nested user
+                            const student = enr.student;
+                            const u = student?.user;
+                            const firstName = u?.firstName || '?';
+                            const lastName = u?.lastName || '';
                             return (
                               <div key={i} className="flex items-center gap-3 p-3 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
-                                <div className="w-9 h-9 bg-gray-300 dark:bg-gray-600 rounded-full flex items-center justify-center">
+                                <div className="w-9 h-9 bg-gray-300 dark:bg-gray-600 rounded-full flex items-center justify-center flex-shrink-0">
                                   <span className="text-gray-700 dark:text-gray-300 font-semibold text-sm">
-                                    {firstName[0]}{lastName[0]}
+                                    {firstName[0]}{lastName[0] || ''}
                                   </span>
                                 </div>
-                                <span className="text-gray-900 dark:text-white text-sm font-medium">
-                                  {firstName} {lastName}
-                                </span>
+                                <div className="min-w-0">
+                                  <p className="text-gray-900 dark:text-white text-sm font-medium truncate">
+                                    {firstName} {lastName}
+                                  </p>
+                                  <p className="text-xs text-gray-500">
+                                    {student?.studentId}
+                                    {enr.enrollmentType === 'subject' && ' · irregular'}
+                                  </p>
+                                </div>
                               </div>
                             );
                           })}
@@ -454,37 +635,46 @@ const ClassSpacePage = () => {
   // ─── Grid view (no class selected) ────────────────────────────────────────
   return (
     <Layout>
-      <div className="min-h-screen bg-gray-100 dark:bg-gray-900 p-6">
-        {/* Page header */}
-        <div className="flex items-center justify-between mb-6">
-          <div>
-            <h1 className="text-2xl font-bold text-gray-900 dark:text-white">
+      <div className="min-h-screen bg-gray-100 dark:bg-gray-900 p-4 sm:p-6">
+        {/* Page header. Stacks on mobile: side by side there isn't room for the
+            title, a search field and the join button on a ~375px screen. */}
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-5 sm:mb-6">
+          <div className="min-w-0">
+            <h1 className="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white">
               {isStudent ? 'My Classes' : 'Class Spaces'}
             </h1>
-            <p className="text-gray-500 dark:text-gray-400 text-sm mt-1">
+            <p className="text-gray-500 dark:text-gray-400 text-sm mt-0.5">
               {filteredClasses.length} {filteredClasses.length === 1 ? 'class' : 'classes'}
             </p>
           </div>
-          <div className="flex items-center gap-3">
-            {/* Search */}
-            <div className="relative">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 w-4 h-4" />
+
+          <div className="flex items-center gap-2 sm:gap-3">
+            {/* Search grows to fill the row on mobile, fixed width from sm up */}
+            <div className="relative flex-1 sm:flex-none">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 w-4 h-4 pointer-events-none" />
               <input
                 type="text"
                 placeholder="Search classes..."
                 value={searchTerm}
                 onChange={e => setSearchTerm(e.target.value)}
-                className="pl-9 pr-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500 w-56"
+                className="w-full sm:w-56 pl-9 pr-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
             </div>
-            {/* Students who haven't enrolled yet see a Join button */}
-            {isStudent && notEnrolled && (
+            {/* Students can always join: irregular students add subjects one at
+                a time, and regular students may need to switch sections. */}
+            {isStudent && (
               <button
                 onClick={() => setShowEnrollModal(true)}
-                className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium text-sm transition-colors"
+                title={isIrregular ? 'Join Subject' : notEnrolled ? 'Join Section' : 'Change Section'}
+                className="flex items-center gap-2 flex-shrink-0 px-3 sm:px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium text-sm transition-colors"
               >
-                <Plus className="w-4 h-4" />
-                Join Section
+                <Plus className="w-4 h-4 flex-shrink-0" />
+                <span className="whitespace-nowrap">
+                  {isIrregular ? 'Join' : notEnrolled ? 'Join' : 'Change'}
+                  <span className="hidden sm:inline">
+                    {isIrregular ? ' Subject' : ' Section'}
+                  </span>
+                </span>
               </button>
             )}
           </div>
@@ -498,20 +688,24 @@ const ClassSpacePage = () => {
             </div>
 
             {isStudent && notEnrolled ? (
-              /* Student has not joined any section yet */
+              /* Student has not joined anything yet. Which code they need
+                 depends on whether they are regular or irregular. */
               <>
                 <h2 className="text-xl font-bold text-gray-900 dark:text-white mb-2">
-                  You haven't joined a section yet
+                  {isIrregular ? "You haven't joined any subjects yet" : "You haven't joined a section yet"}
                 </h2>
                 <p className="text-gray-500 dark:text-gray-400 mb-6 max-w-sm">
-                  Enter the enrollment code from your program manager to join your section. Your subjects will appear automatically.
+                  {joinHint ||
+                    (isIrregular
+                      ? 'Enter a subject class code from your instructor to join a class. As an irregular student you join one subject at a time.'
+                      : 'Enter the enrollment code from your program manager to join your section. Your subjects will appear automatically.')}
                 </p>
                 <button
                   onClick={() => setShowEnrollModal(true)}
                   className="flex items-center gap-2 px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold transition-colors"
                 >
                   <UserPlus className="w-5 h-5" />
-                  Enter Enrollment Code
+                  {isIrregular ? 'Enter Subject Code' : 'Enter Enrollment Code'}
                 </button>
               </>
             ) : isStudent && !notEnrolled ? (
@@ -533,75 +727,79 @@ const ClassSpacePage = () => {
               <>
                 <h2 className="text-xl font-bold text-gray-900 dark:text-white mb-2">No class spaces yet</h2>
                 <p className="text-gray-500 dark:text-gray-400 max-w-sm">
-                  Class spaces are created automatically when sections are added.
+                  {isFaculty
+                    ? 'A class space appears here for each subject you are assigned to teach.'
+                    : 'One class space is created for every subject in a schedule. Add schedules to see them here.'}
                 </p>
               </>
             )}
           </div>
         ) : (
           /* Google Classroom-style card grid */
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 sm:gap-5">
             {filteredClasses.map((cs, index) => {
               const color = CARD_COLORS[index % CARD_COLORS.length];
-              const subjectCode = cs.schedule?.subject?.subjectCode || cs.sectionCode;
-              const subjectName = cs.schedule?.subject?.subjectName || 'No schedule linked';
-              const facultyUser = cs.schedule?.faculty?.user;
-              const facultyName = facultyUser
-                ? `${facultyUser.firstName} ${facultyUser.lastName}`
+              const code = subjectCodeOf(cs);
+              const name = subjectNameOf(cs);
+              const facultyName = facultyNameOf(cs);
+              const initials = facultyName
+                ? facultyName.split(' ').filter(Boolean).map(p => p[0]).slice(0, 2).join('')
                 : null;
-              const initials = facultyUser
-                ? `${facultyUser.firstName?.[0] || ''}${facultyUser.lastName?.[0] || ''}`
-                : null;
+              const slots = timeSlotsOf(cs);
 
               return (
                 <div
                   key={cs._id}
                   className="bg-white dark:bg-gray-800 rounded-xl shadow-md hover:shadow-lg transition-shadow cursor-pointer overflow-hidden flex flex-col"
-                  onClick={() => { setSelectedClass(cs); setActiveTab('stream'); }}
+                  onClick={() => openClass(cs)}
                 >
                   {/* Colored header */}
                   <div className={`${color} p-5 relative h-28 flex flex-col justify-between`}>
-                    <div>
+                    <div className="pr-12">
                       <h3 className="text-white font-bold text-base leading-tight line-clamp-2">
-                        {cs.schedule?.subject?.subjectName || subjectCode}
+                        {name || code}
                       </h3>
                       <p className="text-white/80 text-xs mt-0.5">{cs.sectionCode}</p>
                       {facultyName && (
                         <p className="text-white/70 text-xs mt-0.5 truncate">{facultyName}</p>
                       )}
                     </div>
-                    {/* Instructor avatar — bottom right */}
-                    {initials ? (
-                      <div className="absolute bottom-3 right-3 w-10 h-10 bg-white/20 rounded-full flex items-center justify-center border-2 border-white/40">
+                    {/* Instructor avatar */}
+                    <div className="absolute bottom-3 right-3 w-10 h-10 bg-white/20 rounded-full flex items-center justify-center border-2 border-white/40">
+                      {initials ? (
                         <span className="text-white font-bold text-sm">{initials}</span>
-                      </div>
-                    ) : (
-                      <div className="absolute bottom-3 right-3 w-10 h-10 bg-white/20 rounded-full flex items-center justify-center border-2 border-white/40">
+                      ) : (
                         <User className="w-5 h-5 text-white/70" />
-                      </div>
-                    )}
+                      )}
+                    </div>
                   </div>
 
-                  {/* Subject code below header */}
+                  {/* Subject code + meeting time */}
                   <div className="px-4 py-3 flex-1">
-                    <p className="text-sm font-medium text-gray-700 dark:text-gray-300">{subjectCode}</p>
-                    {cs.schedule?.subject?.subjectName && subjectCode !== cs.schedule.subject.subjectName && (
-                      <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5 line-clamp-1">{subjectName}</p>
+                    <p className="text-sm font-medium text-gray-700 dark:text-gray-300">{code}</p>
+                    {name && name !== code && (
+                      <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5 line-clamp-1">{name}</p>
+                    )}
+                    {slots.length > 0 && (
+                      <p className="text-xs text-gray-400 dark:text-gray-500 mt-1 flex items-center gap-1">
+                        <Clock className="w-3 h-3" />
+                        {summariseSlots(slots)}
+                      </p>
                     )}
                   </div>
 
-                  {/* Bottom action bar — like Google Classroom */}
+                  {/* Bottom action bar */}
                   <div className="border-t border-gray-100 dark:border-gray-700 px-4 py-2 flex items-center justify-between">
                     <div className="flex items-center gap-4 text-gray-400">
                       <button
-                        onClick={e => { e.stopPropagation(); setSelectedClass(cs); setActiveTab('people'); }}
+                        onClick={e => { e.stopPropagation(); openClass(cs).then(() => setActiveTab('people')); }}
                         className="hover:text-gray-600 dark:hover:text-gray-300 transition-colors p-1"
                         title="People"
                       >
                         <Users className="w-4 h-4" />
                       </button>
                       <button
-                        onClick={e => { e.stopPropagation(); setSelectedClass(cs); setActiveTab('materials'); }}
+                        onClick={e => { e.stopPropagation(); openClass(cs).then(() => setActiveTab('materials')); }}
                         className="hover:text-gray-600 dark:hover:text-gray-300 transition-colors p-1"
                         title="Materials"
                       >
@@ -627,7 +825,7 @@ const ClassSpacePage = () => {
       </div>
 
       {showEnrollModal && (
-        <EnrollModal onClose={handleModalClose} />
+        <EnrollModal studentType={studentType} onClose={handleModalClose} />
       )}
     </Layout>
   );

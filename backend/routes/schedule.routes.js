@@ -12,9 +12,11 @@ const {
   checkConflicts,
   publishSchedule,
   batchPublishSchedules,
+  batchDeleteSchedules,
   generateSchedule,
   previewSchedule,
   savePreviewedSchedules,
+  bulkCreateSchedules,
   checkORToolsStatus
 } = require('../controllers/schedule.controller');
 const { protect, authorize } = require('../middleware/auth.middleware');
@@ -53,7 +55,10 @@ router.post('/', authorize('admin', 'scheduling_officer', 'program_manager'), cr
 router.post('/generate', authorize('admin', 'scheduling_officer', 'program_manager'), generateSchedule);
 router.post('/preview', authorize('admin', 'scheduling_officer', 'program_manager'), previewSchedule);
 router.post('/save-preview', authorize('admin', 'scheduling_officer', 'program_manager'), savePreviewedSchedules);
+// Schedule builder "Save All": validates the whole batch, then writes all or nothing
+router.post('/bulk', authorize('admin', 'scheduling_officer', 'program_manager'), bulkCreateSchedules);
 router.post('/publish', authorize('admin', 'scheduling_officer', 'program_manager'), batchPublishSchedules);
+router.post('/batch-delete', authorize('admin', 'scheduling_officer', 'program_manager'), batchDeleteSchedules);
 router.put('/:id', authorize('admin', 'scheduling_officer', 'program_manager'), updateSchedule);
 router.put('/:id/publish', authorize('admin', 'scheduling_officer', 'program_manager'), publishSchedule);
 router.delete('/:id', authorize('admin', 'scheduling_officer', 'program_manager'), deleteSchedule);

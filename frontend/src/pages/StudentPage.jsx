@@ -11,9 +11,11 @@ import {
   Grid3x3, List, Download, FileText, BookOpen, Award
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { usePrograms } from '../hooks/usePrograms';
 
 const StudentPage = () => {
   const { user } = useAuth();
+  const { programCodes } = usePrograms();
   const [students, setStudents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showModal, setShowModal] = useState(false);
@@ -281,13 +283,9 @@ const StudentPage = () => {
                 ) : (
                   <>
                     <option value="">All Programs</option>
-                    <option value="BSIT">BSIT</option>
-                    <option value="BSHM">BSHM</option>
-                    <option value="BIT-ET">BIT-ET</option>
-                    <option value="BIT-CT">BIT-CT</option>
-                    <option value="BIT-AT">BIT-AT</option>
-                    <option value="BSFI">BSFI</option>
-                    <option value="BSIE">BSIE</option>
+                    {programCodes.map(prog => (
+                      <option key={prog} value={prog}>{prog}</option>
+                    ))}
                   </>
                 )}
               </select>

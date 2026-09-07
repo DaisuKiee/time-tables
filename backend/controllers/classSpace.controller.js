@@ -1,435 +1,750 @@
 const ClassSpace = require('../models/ClassSpace.model');
 const Schedule = require('../models/Schedule.model');
-const User = require('../models/User.model');
+const Section = require('../models/Section.model');
+const Student = require('../models/Student.model');
+const Subject = require('../models/Subject.model');
 const { validationResult } = require('express-validator');
 const fs = require('fs').promises;
 const path = require('path');
 
-// @desc    Get all class spaces
+/* ------------------------------------------------------------------ *
+ * Helpers
+ * ------------------------------------------------------------------ */
+
+/** Populate spec used wherever a class space is returned to the client. */
+const CLASS_POPULATE = [
+  { path: 'subject', select: 'subjectCode subjectName units description' },
+  { path: 'faculty', select: 'employeeId', populate: { path: 'user', select: 'firstName lastName email' } },
+  { path: 'schedule', select: 'timeSlots room shift academicYear semester status' },
+];
+
+const DETAIL_POPULATE = [
+  ...CLASS_POPULATE,
+  { path: 'announcements.postedBy', select: 'firstName lastName role' },
+  { path: 'materials.uploadedBy', select: 'firstName lastName role' },
+  {
+    path: 'enrolledStudents.student',
+    select: 'studentId studentType sectionCode',
+    populate: { path: 'user', select: 'firstName lastName email' },
+  },
+];
+
+/** The Student document for the logged-in user, or null. */
+const getStudentFor = (user) => Student.findOne({ user: user._id });
+
+// Shared with the schedule controller: `Schedule.room` is a String holding a
+// Room id, so it can't be populated and needs resolving to a label.
+const { attachNestedScheduleRoomLabels: attachRoomLabels } = require('../utils/roomLabel');
+
+
+const {
+  ensureClassSpaceForSchedule,
+  addStudentToSpace,
+  syncSectionEnrollment,
+} = require('../services/classSpace.service');
+
+/**
+ * Can this user read/write in this class space?
+ * Returns { canRead, canPost, reason }.
+ */
+const resolveAccess = async (user, classSpace) => {
+  // Admins and scheduling officers see everything
+  if (user.role === 'admin' || user.role === 'scheduling_officer') {
+    return { canRead: true, canPost: true };
+  }
+
+  // Program managers are limited to their own program
+  if (user.role === 'program_manager') {
+    const sameProgram = !classSpace.program || classSpace.program === user.program;
+    return {
+      canRead: sameProgram,
+      canPost: sameProgram,
+      reason: sameProgram ? undefined : `This class belongs to ${classSpace.program}, not ${user.program}`,
+    };
+  }
+
+  // Faculty may post only in the classes they teach
+  if (user.role === 'faculty') {
+    const owns =
+      user.facultyProfile &&
+      classSpace.faculty &&
+      classSpace.faculty.toString() === user.facultyProfile.toString();
+    return {
+      canRead: true,
+      canPost: !!owns,
+      reason: owns ? undefined : 'You can only post in classes you teach',
+    };
+  }
+
+  // Students may read only classes they are enrolled in
+  if (user.role === 'student') {
+    const student = await getStudentFor(user);
+    const enrolled = student && classSpace.hasStudent(student._id);
+    return {
+      canRead: !!enrolled,
+      canPost: false,
+      reason: enrolled ? undefined : 'You are not enrolled in this class',
+    };
+  }
+
+  return { canRead: false, canPost: false, reason: 'Not authorized' };
+};
+
+/* ------------------------------------------------------------------ *
+ * Listing
+ * ------------------------------------------------------------------ */
+
+// @desc    Get all class spaces (staff view)
 // @route   GET /api/classSpaces
-// @access  Private
+// @access  Private (admin, scheduling_officer, program_manager, faculty)
 exports.getAllClassSpaces = async (req, res) => {
   try {
-    const { academicYear, semester, program, isActive } = req.query;
+    const { academicYear, semester, program, sectionCode, isActive } = req.query;
 
-    // Build query
-    let query = {};
-    
-    const scheduleQuery = {};
-    if (academicYear) scheduleQuery.academicYear = academicYear;
-    if (semester) scheduleQuery.semester = parseInt(semester);
-    if (program) scheduleQuery.program = program;
+    const query = {};
+    if (academicYear) query.academicYear = academicYear;
+    if (semester) query.semester = parseInt(semester, 10);
+    if (sectionCode) query.sectionCode = sectionCode.toUpperCase();
+    if (isActive !== undefined) query.isActive = isActive === 'true';
 
-    // Get schedules matching criteria
-    const schedules = await Schedule.find(scheduleQuery).select('_id');
-    if (Object.keys(scheduleQuery).length > 0) {
-      query.schedule = { $in: schedules.map(s => s._id) };
+    // Program managers only ever see their own program.
+    // checkProgramAccess also injects req.query.program for them.
+    if (req.user.role === 'program_manager') {
+      query.program = req.user.program;
+    } else if (program) {
+      query.program = program;
     }
 
-    if (isActive !== undefined) {
-      query.isActive = isActive === 'true';
+    // Faculty see the classes they teach
+    if (req.user.role === 'faculty') {
+      query.faculty = req.user.facultyProfile;
     }
 
     const classSpaces = await ClassSpace.find(query)
-      .populate({
-        path: 'schedule',
-        populate: [
-          { path: 'subject', select: 'subjectCode subjectName units' },
-          { path: 'faculty', populate: { path: 'user', select: 'firstName lastName' } }
-        ]
-      })
-      .sort({ createdAt: -1 });
+      .populate(CLASS_POPULATE)
+      .sort({ sectionCode: 1, createdAt: -1 })
+      .lean();
+
+    await attachRoomLabels(classSpaces);
 
     res.status(200).json({
       success: true,
       count: classSpaces.length,
-      data: classSpaces
+      data: classSpaces,
     });
-
   } catch (error) {
     console.error('Get all class spaces error:', error);
     res.status(500).json({
       success: false,
       message: 'Error fetching class spaces',
-      error: error.message
+      error: error.message,
     });
   }
 };
 
-// @desc    Get class space by ID
-// @route   GET /api/classSpaces/:id
+// @desc    Get the current user's class spaces
+// @route   GET /api/classSpaces/my-classes
 // @access  Private
-exports.getClassSpaceById = async (req, res) => {
+exports.getMyClassSpaces = async (req, res) => {
   try {
-    const classSpace = await ClassSpace.findById(req.params.id)
-      .populate({
-        path: 'schedule',
-        populate: [
-          { path: 'subject', select: 'subjectCode subjectName units description' },
-          { path: 'faculty', populate: { path: 'user', select: 'firstName lastName email' } }
-        ]
-      })
-      .populate('announcements.postedBy', 'firstName lastName')
-      .populate('materials.uploadedBy', 'firstName lastName')
-      .populate('enrolledStudents.student', 'firstName lastName email');
+    /* ---------------- Faculty ---------------- */
+    if (req.user.role === 'faculty') {
+      if (!req.user.facultyProfile) {
+        return res.status(200).json({
+          success: true,
+          count: 0,
+          data: [],
+          message: 'No faculty profile is linked to your account',
+        });
+      }
 
-    if (!classSpace) {
-      return res.status(404).json({
-        success: false,
-        message: 'Class space not found'
+      // Make sure every schedule this teacher owns has a space
+      const schedules = await Schedule.find({
+        faculty: req.user.facultyProfile,
+        isActive: true,
+      });
+      for (const s of schedules) {
+        await ensureClassSpaceForSchedule(s);
+      }
+
+      const classSpaces = await ClassSpace.find({
+        faculty: req.user.facultyProfile,
+        isActive: true,
+      })
+        .populate(CLASS_POPULATE)
+        .sort({ sectionCode: 1 })
+        .lean();
+
+      await attachRoomLabels(classSpaces);
+
+      return res.status(200).json({
+        success: true,
+        count: classSpaces.length,
+        role: 'faculty',
+        data: classSpaces,
       });
     }
 
-    res.status(200).json({
-      success: true,
-      data: classSpace
-    });
+    /* ---------------- Student ---------------- */
+    if (req.user.role === 'student') {
+      const student = await getStudentFor(req.user);
 
+      if (!student) {
+        return res.status(200).json({
+          success: true,
+          count: 0,
+          data: [],
+          enrolled: false,
+          message: 'No student profile is linked to your account',
+        });
+      }
+
+      const isIrregular = student.studentType === 'irregular';
+
+      // Nothing joined yet - tell the client which code to ask for
+      const hasJoinedSomething = isIrregular
+        ? (student.subjectCodes || []).length > 0
+        : !!student.sectionCode;
+
+      if (!hasJoinedSomething) {
+        return res.status(200).json({
+          success: true,
+          count: 0,
+          data: [],
+          enrolled: false,
+          studentType: student.studentType,
+          codeType: isIrregular ? 'subject' : 'section',
+          profile: {
+            studentId: student.studentId,
+            program: student.program,
+            studentType: student.studentType,
+            sectionCode: student.sectionCode || null,
+            subjectCodes: student.subjectCodes || [],
+            academicYear: student.academicYear,
+            semester: student.semester,
+            enrollmentStatus: student.enrollmentStatus,
+          },
+          message: isIrregular
+            ? 'Enter a subject class code to join a class'
+            : 'Enter your section enrollment code to join your section',
+        });
+      }
+
+      // Regular students: keep membership in step with their section, so
+      // subjects added to the section after they joined still show up.
+      if (!isIrregular) {
+        await syncSectionEnrollment(student);
+      }
+
+      const classSpaces = await ClassSpace.find({
+        'enrolledStudents.student': student._id,
+        isActive: true,
+      })
+        .populate(CLASS_POPULATE)
+        .sort({ sectionCode: 1 })
+        .lean();
+
+      await attachRoomLabels(classSpaces);
+
+      return res.status(200).json({
+        success: true,
+        count: classSpaces.length,
+        enrolled: true,
+        studentType: student.studentType,
+        codeType: isIrregular ? 'subject' : 'section',
+        sectionCode: student.sectionCode || null,
+        subjectCodes: student.subjectCodes || [],
+        // Enough profile detail for the student dashboard, so it doesn't have to
+        // fetch every student record and pick itself out client-side.
+        profile: {
+          studentId: student.studentId,
+          program: student.program,
+          studentType: student.studentType,
+          sectionCode: student.sectionCode || null,
+          subjectCodes: student.subjectCodes || [],
+          academicYear: student.academicYear,
+          semester: student.semester,
+          enrollmentStatus: student.enrollmentStatus,
+        },
+        data: classSpaces,
+      });
+    }
+
+    /* ---------------- Staff ---------------- */
+    const query = { isActive: true };
+    if (req.user.role === 'program_manager') query.program = req.user.program;
+
+    const classSpaces = await ClassSpace.find(query)
+      .populate(CLASS_POPULATE)
+      .sort({ sectionCode: 1 })
+      .lean();
+
+    await attachRoomLabels(classSpaces);
+
+    return res.status(200).json({
+      success: true,
+      count: classSpaces.length,
+      role: req.user.role,
+      data: classSpaces,
+    });
+  } catch (error) {
+    console.error('Get my classes error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching class spaces',
+      error: error.message,
+    });
+  }
+};
+
+// @desc    Get one class space
+// @route   GET /api/classSpaces/:id
+// @access  Private (must be a member, the teacher, or staff)
+exports.getClassSpaceById = async (req, res) => {
+  try {
+    const classSpace = await ClassSpace.findById(req.params.id).populate(DETAIL_POPULATE);
+
+    if (!classSpace) {
+      return res.status(404).json({ success: false, message: 'Class space not found' });
+    }
+
+    const access = await resolveAccess(req.user, classSpace);
+    if (!access.canRead) {
+      return res.status(403).json({
+        success: false,
+        message: access.reason || 'Not authorized to view this class',
+      });
+    }
+
+    const data = classSpace.toObject();
+    await attachRoomLabels([data]);
+
+    // Students never need to see the join code or the full roster
+    if (req.user.role === 'student') {
+      delete data.classCode;
+      data.enrolledCount = classSpace.enrolledStudents.length;
+      delete data.enrolledStudents;
+    }
+
+    res.status(200).json({ success: true, canPost: access.canPost, data });
   } catch (error) {
     console.error('Get class space error:', error);
     res.status(500).json({
       success: false,
       message: 'Error fetching class space',
-      error: error.message
+      error: error.message,
     });
   }
 };
 
-// @desc    Create class space
-// @route   POST /api/classSpaces
-// @access  Private/Admin
-exports.createClassSpace = async (req, res) => {
-  try {
-    const { scheduleId, sectionCode } = req.body;
+/* ------------------------------------------------------------------ *
+ * Enrollment
+ * ------------------------------------------------------------------ */
 
-    if (!scheduleId || !sectionCode) {
-      return res.status(400).json({
-        success: false,
-        message: 'Schedule ID and section code are required'
-      });
+// @desc    Join by code. Section code for regular students, subject class code for irregular.
+// @route   POST /api/classSpaces/join
+// @access  Private (students)
+exports.joinByCode = async (req, res) => {
+  try {
+    const raw = (req.body.code || req.body.enrollmentCode || '').toString().toUpperCase().trim();
+
+    if (!raw) {
+      return res.status(400).json({ success: false, message: 'An enrollment code is required' });
     }
 
-    // Check if schedule exists
-    const schedule = await Schedule.findById(scheduleId);
-    if (!schedule) {
+    const student = await getStudentFor(req.user);
+    if (!student) {
       return res.status(404).json({
         success: false,
-        message: 'Schedule not found'
+        message: 'No student profile is linked to your account. Contact your program manager.',
       });
     }
 
-    // Check if class space already exists for this schedule
-    const existing = await ClassSpace.findOne({ schedule: scheduleId });
-    if (existing) {
-      return res.status(400).json({
-        success: false,
-        message: 'Class space already exists for this schedule'
-      });
-    }
+    /* ---- irregular: the code identifies ONE subject ---- */
+    if (student.studentType === 'irregular') {
+      const classSpace = await ClassSpace.findOne({ classCode: raw, isActive: true })
+        .populate('subject', 'subjectCode subjectName units program');
 
-    // Create class space
-    const classSpace = new ClassSpace({
-      schedule: scheduleId,
-      sectionCode,
-      announcements: [],
-      materials: [],
-      enrolledStudents: []
-    });
-
-    // Generate unique enrollment code
-    let isUnique = false;
-    while (!isUnique) {
-      const candidate = ClassSpace.generateEnrollmentCode();
-      const existing = await ClassSpace.findOne({ enrollmentCode: candidate });
-      if (!existing) {
-        classSpace.enrollmentCode = candidate;
-        isUnique = true;
-      }
-    }
-
-    await classSpace.save();
-
-    // Link class space to schedule
-    schedule.classSpace = classSpace._id;
-    await schedule.save();
-
-    await classSpace.populate({
-      path: 'schedule',
-      populate: [
-        { path: 'subject', select: 'subjectCode subjectName' },
-        { path: 'faculty', populate: { path: 'user', select: 'firstName lastName' } }
-      ]
-    });
-
-    res.status(201).json({
-      success: true,
-      message: 'Class space created successfully',
-      data: classSpace
-    });
-
-  } catch (error) {
-    console.error('Create class space error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error creating class space',
-      error: error.message
-    });
-  }
-};
-
-// @desc    Update class space
-// @route   PUT /api/classSpaces/:id
-// @access  Private/Admin/Faculty
-exports.updateClassSpace = async (req, res) => {
-  try {
-    const classSpace = await ClassSpace.findById(req.params.id)
-      .populate('schedule');
-
-    if (!classSpace) {
-      return res.status(404).json({
-        success: false,
-        message: 'Class space not found'
-      });
-    }
-
-    // Faculty can only update their own class spaces
-    if (req.user.role === 'faculty') {
-      const schedule = await Schedule.findById(classSpace.schedule).populate('faculty');
-      if (schedule.faculty.user.toString() !== req.user._id.toString()) {
-        return res.status(403).json({
+      if (!classSpace) {
+        return res.status(404).json({
           success: false,
-          message: 'Not authorized to update this class space'
+          message: 'Invalid subject class code. Irregular students join one subject at a time.',
         });
       }
-    }
 
-    const { isActive } = req.body;
-    if (isActive !== undefined) classSpace.isActive = isActive;
+      if (classSpace.hasStudent(student._id)) {
+        return res.status(400).json({
+          success: false,
+          message: `You have already joined ${classSpace.subject?.subjectCode}`,
+        });
+      }
 
-    await classSpace.save();
+      await addStudentToSpace(classSpace, student, 'subject');
 
-    res.status(200).json({
-      success: true,
-      message: 'Class space updated successfully',
-      data: classSpace
-    });
+      const subjectCode = classSpace.subject?.subjectCode;
+      await Student.updateOne(
+        { _id: student._id },
+        {
+          $addToSet: { subjectCodes: subjectCode },
+          $set: { enrollmentStatus: 'enrolled' },
+        }
+      );
 
-  } catch (error) {
-    console.error('Update class space error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error updating class space',
-      error: error.message
-    });
-  }
-};
-
-// @desc    Delete class space
-// @route   DELETE /api/classSpaces/:id
-// @access  Private/Admin
-exports.deleteClassSpace = async (req, res) => {
-  try {
-    const classSpace = await ClassSpace.findById(req.params.id);
-
-    if (!classSpace) {
-      return res.status(404).json({
-        success: false,
-        message: 'Class space not found'
+      return res.status(200).json({
+        success: true,
+        joined: 'subject',
+        message: `Joined ${subjectCode} - ${classSpace.subject?.subjectName}`,
+        data: {
+          classSpaceId: classSpace._id,
+          subjectCode,
+          subjectName: classSpace.subject?.subjectName,
+          sectionCode: classSpace.sectionCode,
+        },
       });
     }
 
-    classSpace.isActive = false;
-    await classSpace.save();
-
-    res.status(200).json({
-      success: true,
-      message: 'Class space deleted successfully'
+    /* ---- regular: the code identifies a SECTION ---- */
+    const section = await Section.findOne({ enrollmentCode: raw, isActive: true }).populate({
+      path: 'adviser',
+      populate: { path: 'user', select: 'firstName lastName' },
     });
 
+    if (!section) {
+      // Give a precise error if they pasted a subject code by mistake
+      const asClass = await ClassSpace.findOne({ classCode: raw, isActive: true });
+      if (asClass) {
+        return res.status(400).json({
+          success: false,
+          message:
+            'That is a subject class code. Regular students join with a section enrollment code from their program manager.',
+        });
+      }
+      return res.status(404).json({
+        success: false,
+        message: 'Invalid section enrollment code. Please check and try again.',
+      });
+    }
+
+    if (student.sectionCode === section.sectionCode) {
+      return res.status(400).json({
+        success: false,
+        message: `You are already enrolled in ${section.sectionCode}`,
+      });
+    }
+
+    if (section.currentStudents >= section.maxStudents) {
+      return res.status(400).json({ success: false, message: 'This section is already full' });
+    }
+
+    const previousSectionCode = student.sectionCode;
+
+    // Move the student to the new section
+    student.sectionCode = section.sectionCode;
+    student.enrollmentStatus = 'enrolled';
+    student.academicYear = section.academicYear;
+    student.semester = section.semester;
+    await student.save();
+
+    // Leaving a section must release the old seat, otherwise the counter drifts
+    if (previousSectionCode && previousSectionCode !== section.sectionCode) {
+      await Section.updateOne(
+        { sectionCode: previousSectionCode, currentStudents: { $gt: 0 } },
+        { $inc: { currentStudents: -1 } }
+      );
+
+      const oldSpaces = await ClassSpace.find({ sectionCode: previousSectionCode });
+      for (const cs of oldSpaces) {
+        if (cs.removeStudent(student._id)) await cs.save();
+      }
+      await Student.updateOne(
+        { _id: student._id },
+        { $pull: { enrolledClasses: { $in: oldSpaces.map(s => s._id) } } }
+      );
+    }
+
+    await Section.updateOne({ _id: section._id }, { $inc: { currentStudents: 1 } });
+
+    // Enroll into every subject the section takes
+    const joined = await syncSectionEnrollment(student);
+
+    return res.status(200).json({
+      success: true,
+      joined: 'section',
+      message: `Enrolled in ${section.sectionCode} with ${joined.length} ${
+        joined.length === 1 ? 'subject' : 'subjects'
+      }`,
+      data: {
+        sectionCode: section.sectionCode,
+        program: section.program,
+        yearLevel: section.yearLevel,
+        shift: section.shift,
+        academicYear: section.academicYear,
+        semester: section.semester,
+        classCount: joined.length,
+        adviser: section.adviser?.user
+          ? `${section.adviser.user.firstName} ${section.adviser.user.lastName}`
+          : null,
+      },
+    });
   } catch (error) {
-    console.error('Delete class space error:', error);
+    console.error('Join by code error:', error);
     res.status(500).json({
       success: false,
-      message: 'Error deleting class space',
-      error: error.message
+      message: 'Error joining class',
+      error: error.message,
     });
   }
 };
 
-// @desc    Post announcement
+// @desc    Leave a class space (irregular students drop a single subject)
+// @route   POST /api/classSpaces/:id/leave
+// @access  Private (students)
+exports.leaveClassSpace = async (req, res) => {
+  try {
+    const classSpace = await ClassSpace.findById(req.params.id).populate('subject', 'subjectCode');
+    if (!classSpace) {
+      return res.status(404).json({ success: false, message: 'Class space not found' });
+    }
+
+    const student = await getStudentFor(req.user);
+    if (!student) {
+      return res.status(404).json({ success: false, message: 'Student profile not found' });
+    }
+
+    const entry = classSpace.findEnrollment(student._id);
+    if (!entry) {
+      return res.status(400).json({ success: false, message: 'You are not enrolled in this class' });
+    }
+
+    // Section-based membership is driven by the section, not per class
+    if (entry.enrollmentType === 'section') {
+      return res.status(400).json({
+        success: false,
+        message:
+          'This class comes from your section. Ask your program manager to change your section.',
+      });
+    }
+
+    classSpace.removeStudent(student._id);
+    await classSpace.save();
+
+    await Student.updateOne(
+      { _id: student._id },
+      {
+        $pull: {
+          enrolledClasses: classSpace._id,
+          subjectCodes: classSpace.subject?.subjectCode,
+        },
+      }
+    );
+
+    res.status(200).json({
+      success: true,
+      message: `Left ${classSpace.subject?.subjectCode || 'class'}`,
+    });
+  } catch (error) {
+    console.error('Leave class space error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error leaving class',
+      error: error.message,
+    });
+  }
+};
+
+// @desc    Regenerate a class space's join code
+// @route   PUT /api/classSpaces/:id/regenerate-code
+// @access  Private (teacher of the class, or staff)
+exports.regenerateClassCode = async (req, res) => {
+  try {
+    const classSpace = await ClassSpace.findById(req.params.id);
+    if (!classSpace) {
+      return res.status(404).json({ success: false, message: 'Class space not found' });
+    }
+
+    const access = await resolveAccess(req.user, classSpace);
+    if (!access.canPost) {
+      return res.status(403).json({ success: false, message: access.reason || 'Not authorized' });
+    }
+
+    classSpace.classCode = await ClassSpace.generateUniqueClassCode();
+    await classSpace.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Class code regenerated',
+      data: { classCode: classSpace.classCode },
+    });
+  } catch (error) {
+    console.error('Regenerate class code error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error regenerating class code',
+      error: error.message,
+    });
+  }
+};
+
+/* ------------------------------------------------------------------ *
+ * Announcements
+ * ------------------------------------------------------------------ */
+
+// @desc    Post an announcement
 // @route   POST /api/classSpaces/:id/announcements
-// @access  Private/Faculty
+// @access  Private (teacher of the class, or staff)
 exports.postAnnouncement = async (req, res) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        errors: errors.array()
-      });
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    const classSpace = await ClassSpace.findById(req.params.id);
+    if (!classSpace) {
+      return res.status(404).json({ success: false, message: 'Class space not found' });
+    }
+
+    const access = await resolveAccess(req.user, classSpace);
+    if (!access.canPost) {
+      return res.status(403).json({ success: false, message: access.reason || 'Not authorized' });
     }
 
     const { title, content, isPinned } = req.body;
 
-    const classSpace = await ClassSpace.findById(req.params.id);
-    if (!classSpace) {
-      return res.status(404).json({
-        success: false,
-        message: 'Class space not found'
-      });
-    }
-
-    // Add announcement
     classSpace.announcements.push({
       title,
       content,
+      isPinned: isPinned === true || isPinned === 'true',
       postedBy: req.user._id,
-      isPinned: isPinned || false,
-      createdAt: new Date()
     });
 
     await classSpace.save();
-    await classSpace.populate('announcements.postedBy', 'firstName lastName');
+    await classSpace.populate('announcements.postedBy', 'firstName lastName role');
 
     res.status(201).json({
       success: true,
-      message: 'Announcement posted successfully',
-      data: classSpace.announcements[classSpace.announcements.length - 1]
+      message: 'Announcement posted',
+      data: classSpace.announcements[classSpace.announcements.length - 1],
     });
-
   } catch (error) {
     console.error('Post announcement error:', error);
     res.status(500).json({
       success: false,
       message: 'Error posting announcement',
-      error: error.message
+      error: error.message,
     });
   }
 };
 
-// @desc    Update announcement
+// @desc    Update an announcement
 // @route   PUT /api/classSpaces/:id/announcements/:announcementId
-// @access  Private/Faculty
+// @access  Private (author or admin)
 exports.updateAnnouncement = async (req, res) => {
   try {
-    const { title, content, isPinned } = req.body;
-
     const classSpace = await ClassSpace.findById(req.params.id);
     if (!classSpace) {
-      return res.status(404).json({
-        success: false,
-        message: 'Class space not found'
-      });
+      return res.status(404).json({ success: false, message: 'Class space not found' });
     }
 
     const announcement = classSpace.announcements.id(req.params.announcementId);
     if (!announcement) {
-      return res.status(404).json({
-        success: false,
-        message: 'Announcement not found'
-      });
+      return res.status(404).json({ success: false, message: 'Announcement not found' });
     }
 
-    // Only author can edit
-    if (announcement.postedBy.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
+    const isAuthor = announcement.postedBy.toString() === req.user._id.toString();
+    if (!isAuthor && req.user.role !== 'admin') {
       return res.status(403).json({
         success: false,
-        message: 'Not authorized to edit this announcement'
+        message: 'Only the author can edit this announcement',
       });
     }
 
-    if (title) announcement.title = title;
-    if (content) announcement.content = content;
-    if (isPinned !== undefined) announcement.isPinned = isPinned;
+    const { title, content, isPinned } = req.body;
+    if (title !== undefined) announcement.title = title;
+    if (content !== undefined) announcement.content = content;
+    if (isPinned !== undefined) announcement.isPinned = isPinned === true || isPinned === 'true';
+    announcement.editedAt = new Date();
 
     await classSpace.save();
+    await classSpace.populate('announcements.postedBy', 'firstName lastName role');
 
-    res.status(200).json({
-      success: true,
-      message: 'Announcement updated successfully',
-      data: announcement
-    });
-
+    res.status(200).json({ success: true, message: 'Announcement updated', data: announcement });
   } catch (error) {
     console.error('Update announcement error:', error);
     res.status(500).json({
       success: false,
       message: 'Error updating announcement',
-      error: error.message
+      error: error.message,
     });
   }
 };
 
-// @desc    Delete announcement
+// @desc    Delete an announcement
 // @route   DELETE /api/classSpaces/:id/announcements/:announcementId
-// @access  Private/Faculty
+// @access  Private (author or admin)
 exports.deleteAnnouncement = async (req, res) => {
   try {
     const classSpace = await ClassSpace.findById(req.params.id);
     if (!classSpace) {
-      return res.status(404).json({
-        success: false,
-        message: 'Class space not found'
-      });
+      return res.status(404).json({ success: false, message: 'Class space not found' });
     }
 
     const announcement = classSpace.announcements.id(req.params.announcementId);
     if (!announcement) {
-      return res.status(404).json({
-        success: false,
-        message: 'Announcement not found'
-      });
+      return res.status(404).json({ success: false, message: 'Announcement not found' });
     }
 
-    // Only author can delete
-    if (announcement.postedBy.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
+    const isAuthor = announcement.postedBy.toString() === req.user._id.toString();
+    if (!isAuthor && req.user.role !== 'admin') {
       return res.status(403).json({
         success: false,
-        message: 'Not authorized to delete this announcement'
+        message: 'Only the author can delete this announcement',
       });
     }
 
-    announcement.remove();
+    // Mongoose 7 removed subdoc.remove(); pull by id instead
+    classSpace.announcements.pull({ _id: req.params.announcementId });
     await classSpace.save();
 
-    res.status(200).json({
-      success: true,
-      message: 'Announcement deleted successfully'
-    });
-
+    res.status(200).json({ success: true, message: 'Announcement deleted' });
   } catch (error) {
     console.error('Delete announcement error:', error);
     res.status(500).json({
       success: false,
       message: 'Error deleting announcement',
-      error: error.message
+      error: error.message,
     });
   }
 };
 
-// @desc    Upload material
+/* ------------------------------------------------------------------ *
+ * Materials
+ * ------------------------------------------------------------------ */
+
+// @desc    Upload a material
 // @route   POST /api/classSpaces/:id/materials
-// @access  Private/Faculty
+// @access  Private (teacher of the class, or staff)
 exports.uploadMaterial = async (req, res) => {
   try {
     if (!req.file) {
-      return res.status(400).json({
-        success: false,
-        message: 'Please upload a file'
-      });
+      return res.status(400).json({ success: false, message: 'Please attach a file' });
+    }
+
+    const classSpace = await ClassSpace.findById(req.params.id);
+    if (!classSpace) {
+      await fs.unlink(req.file.path).catch(() => {});
+      return res.status(404).json({ success: false, message: 'Class space not found' });
+    }
+
+    const access = await resolveAccess(req.user, classSpace);
+    if (!access.canPost) {
+      // Don't leave an orphan file behind on a rejected upload
+      await fs.unlink(req.file.path).catch(() => {});
+      return res.status(403).json({ success: false, message: access.reason || 'Not authorized' });
     }
 
     const { title, description } = req.body;
 
-    const classSpace = await ClassSpace.findById(req.params.id);
-    if (!classSpace) {
-      return res.status(404).json({
-        success: false,
-        message: 'Class space not found'
-      });
-    }
-
-    // Add material
     classSpace.materials.push({
       title: title || req.file.originalname,
       description: description || '',
@@ -438,435 +753,176 @@ exports.uploadMaterial = async (req, res) => {
       fileSize: req.file.size,
       fileType: req.file.mimetype,
       uploadedBy: req.user._id,
-      uploadedAt: new Date()
     });
 
     await classSpace.save();
-    await classSpace.populate('materials.uploadedBy', 'firstName lastName');
+    await classSpace.populate('materials.uploadedBy', 'firstName lastName role');
 
     res.status(201).json({
       success: true,
-      message: 'Material uploaded successfully',
-      data: classSpace.materials[classSpace.materials.length - 1]
+      message: 'Material uploaded',
+      data: classSpace.materials[classSpace.materials.length - 1],
     });
-
   } catch (error) {
     console.error('Upload material error:', error);
+    if (req.file) await fs.unlink(req.file.path).catch(() => {});
     res.status(500).json({
       success: false,
       message: 'Error uploading material',
-      error: error.message
+      error: error.message,
     });
   }
 };
 
-// @desc    Delete material
+// @desc    Delete a material
 // @route   DELETE /api/classSpaces/:id/materials/:materialId
-// @access  Private/Faculty
+// @access  Private (uploader or admin)
 exports.deleteMaterial = async (req, res) => {
   try {
     const classSpace = await ClassSpace.findById(req.params.id);
     if (!classSpace) {
-      return res.status(404).json({
-        success: false,
-        message: 'Class space not found'
-      });
+      return res.status(404).json({ success: false, message: 'Class space not found' });
     }
 
     const material = classSpace.materials.id(req.params.materialId);
     if (!material) {
-      return res.status(404).json({
-        success: false,
-        message: 'Material not found'
-      });
+      return res.status(404).json({ success: false, message: 'Material not found' });
     }
 
-    // Only uploader can delete
-    if (material.uploadedBy.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
+    const isUploader = material.uploadedBy.toString() === req.user._id.toString();
+    if (!isUploader && req.user.role !== 'admin') {
       return res.status(403).json({
         success: false,
-        message: 'Not authorized to delete this material'
+        message: 'Only the uploader can delete this material',
       });
     }
 
-    // Delete file from disk
+    // Remove the file, but never let a missing file block the DB update
     try {
-      const filePath = path.join(__dirname, '..', material.fileUrl);
-      await fs.unlink(filePath);
+      const uploadRoot = process.env.UPLOAD_PATH || path.join(__dirname, '..', 'uploads');
+      await fs.unlink(path.join(uploadRoot, path.basename(material.fileUrl)));
     } catch (fileError) {
-      console.warn('Could not delete file:', fileError.message);
+      console.warn('Could not delete file from disk:', fileError.message);
     }
 
-    material.remove();
+    // Mongoose 7 removed subdoc.remove(); pull by id instead
+    classSpace.materials.pull({ _id: req.params.materialId });
     await classSpace.save();
 
-    res.status(200).json({
-      success: true,
-      message: 'Material deleted successfully'
-    });
-
+    res.status(200).json({ success: true, message: 'Material deleted' });
   } catch (error) {
     console.error('Delete material error:', error);
     res.status(500).json({
       success: false,
       message: 'Error deleting material',
-      error: error.message
+      error: error.message,
     });
   }
 };
 
-// @desc    Enroll student in class
-// @route   POST /api/classSpaces/:id/enroll
-// @access  Private
-exports.enrollStudent = async (req, res) => {
+/* ------------------------------------------------------------------ *
+ * Admin
+ * ------------------------------------------------------------------ */
+
+// @desc    Create a class space for a schedule
+// @route   POST /api/classSpaces
+// @access  Private (admin, scheduling_officer, program_manager)
+exports.createClassSpace = async (req, res) => {
   try {
-    const classSpace = await ClassSpace.findById(req.params.id);
-    if (!classSpace) {
-      return res.status(404).json({
-        success: false,
-        message: 'Class space not found'
-      });
+    const { scheduleId } = req.body;
+    if (!scheduleId) {
+      return res.status(400).json({ success: false, message: 'scheduleId is required' });
     }
 
-    // Check if student already enrolled
-    const alreadyEnrolled = classSpace.enrolledStudents.some(
-      enrollment => enrollment.student.toString() === req.user._id.toString()
-    );
-
-    if (alreadyEnrolled) {
-      return res.status(400).json({
-        success: false,
-        message: 'Already enrolled in this class'
-      });
+    const schedule = await Schedule.findById(scheduleId);
+    if (!schedule) {
+      return res.status(404).json({ success: false, message: 'Schedule not found' });
     }
 
-    // Check class capacity
-    const schedule = await Schedule.findById(classSpace.schedule);
-    if (schedule && schedule.enrolledStudents >= schedule.maxStudents) {
-      return res.status(400).json({
-        success: false,
-        message: 'Class is full'
-      });
-    }
-
-    // Enroll student
-    classSpace.enrolledStudents.push({
-      student: req.user._id,
-      enrolledAt: new Date(),
-      isRegular: req.body.isRegular !== false
-    });
-
-    // Update schedule enrollment count if schedule exists
-    if (schedule) {
-      schedule.enrolledStudents += 1;
-      await schedule.save();
-    }
-
-    await classSpace.save();
-
-    res.status(200).json({
-      success: true,
-      message: 'Enrolled successfully',
-      data: classSpace
-    });
-
-  } catch (error) {
-    console.error('Enroll student error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error enrolling student',
-      error: error.message
-    });
-  }
-};
-
-// @desc    Unenroll student from class
-// @route   POST /api/classSpaces/:id/unenroll
-// @access  Private
-exports.unenrollStudent = async (req, res) => {
-  try {
-    const classSpace = await ClassSpace.findById(req.params.id);
-    if (!classSpace) {
-      return res.status(404).json({
-        success: false,
-        message: 'Class space not found'
-      });
-    }
-
-    // Find enrollment
-    const enrollmentIndex = classSpace.enrolledStudents.findIndex(
-      enrollment => enrollment.student.toString() === req.user._id.toString()
-    );
-
-    if (enrollmentIndex === -1) {
-      return res.status(400).json({
-        success: false,
-        message: 'Not enrolled in this class'
-      });
-    }
-
-    // Remove enrollment
-    classSpace.enrolledStudents.splice(enrollmentIndex, 1);
-
-    // Update schedule enrollment count if schedule exists
-    const schedule = await Schedule.findById(classSpace.schedule);
-    if (schedule && schedule.enrolledStudents > 0) {
-      schedule.enrolledStudents -= 1;
-      await schedule.save();
-    }
-
-    await classSpace.save();
-
-    res.status(200).json({
-      success: true,
-      message: 'Unenrolled successfully'
-    });
-
-  } catch (error) {
-    console.error('Unenroll student error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error unenrolling student',
-      error: error.message
-    });
-  }
-};
-
-// @desc    Get class space by enrollment code
-// @route   GET /api/classSpaces/code/:enrollmentCode
-// @access  Private
-exports.getClassSpaceByCode = async (req, res) => {
-  try {
-    const code = req.params.enrollmentCode.toUpperCase().trim();
-
-    const classSpace = await ClassSpace.findOne({ 
-      enrollmentCode: code,
-      isActive: true 
-    })
-    .populate({
-      path: 'schedule',
-      populate: [
-        { path: 'subject', select: 'subjectCode subjectName units' },
-        { path: 'faculty', populate: { path: 'user', select: 'firstName lastName' } }
-      ]
-    });
-
-    if (!classSpace) {
-      return res.status(404).json({
-        success: false,
-        message: 'Invalid enrollment code. Please check the code and try again.'
-      });
-    }
-
-    res.status(200).json({
-      success: true,
-      data: classSpace
-    });
-
-  } catch (error) {
-    console.error('Get class space by code error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching class space',
-      error: error.message
-    });
-  }
-};
-
-// @desc    Get my class spaces (student/faculty)
-// @route   GET /api/classSpaces/my-classes
-// @access  Private
-exports.getMyClassSpaces = async (req, res) => {
-  try {
-    let classSpaces;
-
-    if (req.user.role === 'faculty') {
-      // Faculty: get all class spaces for their schedules
-      const schedules = await Schedule.find({
-        faculty: req.user.facultyProfile,
-        isActive: true
-      });
-
-      classSpaces = await ClassSpace.find({
-        schedule: { $in: schedules.map(s => s._id) },
-        isActive: true
-      })
-      .populate({
-        path: 'schedule',
-        populate: [
-          { path: 'subject', select: 'subjectCode subjectName units' },
-          { path: 'faculty', populate: { path: 'user', select: 'firstName lastName profilePicture' } }
-        ]
-      });
-
-    } else if (req.user.role === 'student') {
-      const Student = require('../models/Student.model');
-      const student = await Student.findOne({ user: req.user._id });
-
-      if (!student || !student.sectionCode) {
-        // Student hasn't enrolled in a section yet
-        return res.status(200).json({
-          success: true,
-          count: 0,
-          data: [],
-          enrolled: false
-        });
-      }
-
-      // Find all published schedules for this student's section
-      const schedules = await Schedule.find({
-        sectionCode: student.sectionCode,
-        isActive: true
-      });
-
-      // Get or create ClassSpaces for each schedule
-      classSpaces = [];
-      for (const schedule of schedules) {
-        let cs = await ClassSpace.findOne({ schedule: schedule._id });
-        if (!cs) {
-          // Auto-create ClassSpace if it doesn't exist yet
-          cs = await ClassSpace.create({
-            schedule: schedule._id,
-            sectionCode: schedule.sectionCode + '-' + schedule._id.toString().slice(-4),
-            announcements: [],
-            materials: [],
-            enrolledStudents: [],
-            isActive: true
-          });
-        }
-        await cs.populate({
-          path: 'schedule',
-          populate: [
-            { path: 'subject', select: 'subjectCode subjectName units' },
-            { path: 'faculty', populate: { path: 'user', select: 'firstName lastName profilePicture' } }
-          ]
-        });
-        classSpaces.push(cs);
-      }
-
-      // Also include the section-level ClassSpace (schedule: null)
-      const sectionCS = await ClassSpace.findOne({ 
-        sectionCode: student.sectionCode, 
-        schedule: null,
-        isActive: true
-      });
-      if (sectionCS) {
-        classSpaces.unshift(sectionCS);
-      }
-
-    } else {
+    if (req.user.role === 'program_manager' && schedule.program !== req.user.program) {
       return res.status(403).json({
         success: false,
-        message: 'Not authorized'
+        message: `You can only create class spaces for ${req.user.program}`,
       });
     }
 
-    res.status(200).json({
-      success: true,
-      count: classSpaces.length,
-      data: classSpaces
-    });
+    const existing = await ClassSpace.findOne({ schedule: scheduleId });
+    if (existing) {
+      return res.status(400).json({
+        success: false,
+        message: 'A class space already exists for this schedule',
+        data: existing,
+      });
+    }
 
+    const classSpace = await ensureClassSpaceForSchedule(schedule);
+    await Schedule.updateOne({ _id: schedule._id }, { classSpace: classSpace._id });
+    await classSpace.populate(CLASS_POPULATE);
+
+    res.status(201).json({ success: true, message: 'Class space created', data: classSpace });
   } catch (error) {
-    console.error('Get my classes error:', error);
+    console.error('Create class space error:', error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching class spaces',
-      error: error.message
+      message: 'Error creating class space',
+      error: error.message,
     });
   }
 };
 
-// @desc    Enroll student by section enrollment code
-// @route   POST /api/classSpaces/enroll-by-code
-// @access  Private (students only)
-exports.enrollByCode = async (req, res) => {
+// @desc    Update a class space
+// @route   PUT /api/classSpaces/:id
+// @access  Private (teacher of the class, or staff)
+exports.updateClassSpace = async (req, res) => {
   try {
-    const { enrollmentCode } = req.body;
-
-    if (!enrollmentCode) {
-      return res.status(400).json({
-        success: false,
-        message: 'Enrollment code is required'
-      });
+    const classSpace = await ClassSpace.findById(req.params.id);
+    if (!classSpace) {
+      return res.status(404).json({ success: false, message: 'Class space not found' });
     }
 
-    const Section = require('../models/Section.model');
-    const Student = require('../models/Student.model');
-
-    // 1. Find the section with this enrollment code
-    const section = await Section.findOne({
-      enrollmentCode: enrollmentCode.toUpperCase().trim(),
-      isActive: true
-    }).populate({
-      path: 'adviser',
-      populate: { path: 'user', select: 'firstName lastName' }
-    });
-
-    if (!section) {
-      return res.status(404).json({
-        success: false,
-        message: 'Invalid enrollment code. Please check and try again.'
-      });
+    const access = await resolveAccess(req.user, classSpace);
+    if (!access.canPost) {
+      return res.status(403).json({ success: false, message: access.reason || 'Not authorized' });
     }
 
-    // 2. Find the student profile
-    const student = await Student.findOne({ user: req.user._id });
-    if (!student) {
-      return res.status(404).json({
-        success: false,
-        message: 'Student profile not found'
-      });
+    if (req.body.isActive !== undefined) {
+      classSpace.isActive = req.body.isActive === true || req.body.isActive === 'true';
     }
 
-    // 3. Check if already enrolled in this section
-    if (student.sectionCode === section.sectionCode) {
-      return res.status(400).json({
-        success: false,
-        message: `You are already enrolled in section ${section.sectionCode}`
-      });
-    }
+    await classSpace.save();
+    await classSpace.populate(CLASS_POPULATE);
 
-    // 4. Check capacity
-    if (section.currentStudents >= section.maxStudents) {
-      return res.status(400).json({
-        success: false,
-        message: 'This section is already full'
-      });
-    }
-
-    // 5. Set student's sectionCode and update enrollment info from the section
-    student.sectionCode = section.sectionCode;
-    student.enrollmentStatus = 'enrolled';
-    student.academicYear = section.academicYear;
-    student.semester = section.semester;
-    await student.save();
-
-    // 6. Increment section's currentStudents count
-    await Section.findByIdAndUpdate(section._id, { $inc: { currentStudents: 1 } });
-
-    res.status(200).json({
-      success: true,
-      message: `Successfully enrolled in ${section.sectionCode}`,
-      data: {
-        sectionCode: section.sectionCode,
-        program: section.program,
-        yearLevel: section.yearLevel,
-        shift: section.shift,
-        academicYear: section.academicYear,
-        semester: section.semester,
-        adviser: section.adviser?.user
-          ? `${section.adviser.user.firstName} ${section.adviser.user.lastName}`
-          : null
-      }
-    });
-
+    res.status(200).json({ success: true, message: 'Class space updated', data: classSpace });
   } catch (error) {
-    console.error('Enroll by code error:', error);
+    console.error('Update class space error:', error);
     res.status(500).json({
       success: false,
-      message: 'Error enrolling in section',
-      error: error.message
+      message: 'Error updating class space',
+      error: error.message,
+    });
+  }
+};
+
+// @desc    Deactivate a class space
+// @route   DELETE /api/classSpaces/:id
+// @access  Private (admin)
+exports.deleteClassSpace = async (req, res) => {
+  try {
+    const classSpace = await ClassSpace.findById(req.params.id);
+    if (!classSpace) {
+      return res.status(404).json({ success: false, message: 'Class space not found' });
+    }
+
+    classSpace.isActive = false;
+    await classSpace.save();
+
+    res.status(200).json({ success: true, message: 'Class space deactivated' });
+  } catch (error) {
+    console.error('Delete class space error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error deleting class space',
+      error: error.message,
     });
   }
 };

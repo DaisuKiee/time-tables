@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
+import { aiChatAPI } from '../services/api';
 import { X, Save, User, MapPin, Users, BookOpen, Clock, Calendar, CheckCircle, AlertCircle, Sparkles, Star, TrendingUp, Loader, School, Info, Trash2 } from 'lucide-react';
 
 const SUBJECT_COLORS = [
@@ -25,76 +26,84 @@ const fmtTime = (t) => {
 const EditScheduleModal = ({ schedule, faculty, rooms, onUpdate, onClose, onSave, onDelete, isSaved = false }) => {
   const [facultyScores, setFacultyScores] = useState({});
   const [loadingScores, setLoadingScores] = useState(false);
-  
-  if (!schedule) return null;
+  // What the ranking was actually able to base itself on, so an empty result
+  // explains itself instead of looking like a broken feature.
+  const [rankingNote, setRankingNote] = useState(null);
 
-  // Use _id for saved schedules, tempId for pending
-  const scheduleId = isSaved ? schedule._id : schedule.tempId;
+  const subjectId = schedule?.subject;
+  const subjectCode = schedule?.subjectData?.subjectCode;
+  const subjectName = schedule?.subjectData?.subjectName;
 
-  // Debug: Check if schedule has identifier
-  React.useEffect(() => {
-    console.log('EditScheduleModal opened with schedule:', {
-      id: scheduleId,
-      isSaved,
-      subject: schedule.subject,
-      faculty: schedule.faculty,
-      room: schedule.room,
-    });
-  }, []);
+  /*
+   * Fetch the experience ranking for this subject.
+   *
+   * Previously this read `rec.faculty._id` and `rec.subjectExperience`, neither
+   * of which the endpoint returns - it returns `facultyId` and `timesTaught`.
+   * So `facultyId` was always undefined, every row was skipped, and the score
+   * map stayed empty: no ranking, no percentages, no experience shown. The
+   * request itself was working the whole time.
+   *
+   * It also used raw fetch against a hardcoded http://localhost:5000, which
+   * could never work off this machine, and swallowed every error silently.
+   */
+  useEffect(() => {
+    if (!subjectId && !subjectCode && !subjectName) return;
 
-  // Fetch AI scores when modal opens
-  React.useEffect(() => {
+    let cancelled = false;
+
     const fetchFacultyScores = async () => {
-      if (!schedule.subject) return;
-      
       setLoadingScores(true);
       try {
-        const token = localStorage.getItem('token');
-        const response = await fetch('http://localhost:5000/api/ai/recommend-faculty', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${token}`,
-          },
-          body: JSON.stringify({
-            subjectId: schedule.subject,
-            subjectCode: schedule.subjectData?.subjectCode,
-            subjectName: schedule.subjectData?.subjectName,
-          }),
+        const { data } = await aiChatAPI.recommendFaculty({
+          subjectId,
+          subjectCode,
+          subjectName,
+        });
+        if (cancelled) return;
+
+        const recommendations = data?.recommendations || [];
+        const scores = {};
+
+        recommendations.forEach((rec) => {
+          if (!rec?.facultyId) return;
+          scores[String(rec.facultyId)] = {
+            // `score` is already out of 100 from the scoring engine. Scaling it
+            // against the top candidate instead would show 100% for whoever
+            // happens to rank first, even with no experience at all.
+            percentage: Math.round(rec.score),
+            timesTaught: rec.timesTaught || 0,
+            lastTaught: rec.lastTaughtAcademicYear || null,
+            isStale: !!rec.experienceIsDated,
+            reason: rec.reason || '',
+            rank: rec.rank,
+          };
         });
 
-        const data = await response.json();
-        
-        if (data.success && data.recommendations) {
-          // Create a map of faculty ID to match percentage
-          const scores = {};
-          const maxScore = data.recommendations[0]?.score || 1;
-          
-          data.recommendations.forEach(rec => {
-            // Safely access faculty ID
-            const facultyId = rec.faculty?._id || rec.faculty;
-            if (!facultyId) return; // Skip if no valid ID
-            
-            // Calculate percentage based on score relative to best score
-            const percentage = Math.round((rec.score / maxScore) * 100);
-            scores[facultyId] = {
-              percentage,
-              experienceYears: rec.subjectExperience || 0,
-            };
-          });
-          
-          setFacultyScores(scores);
-        }
+        setFacultyScores(scores);
+        setRankingNote(data?.message || null);
       } catch (error) {
-        console.error('Error fetching faculty scores:', error);
-        // Silently fail - dropdown will work without scores
+        // Report it. A silent failure here is indistinguishable from "no data",
+        // which is what made this look like the ranking simply did nothing.
+        console.error('Faculty recommendation failed:', error);
+        if (cancelled) return;
+        setFacultyScores({});
+        setRankingNote(
+          error.response?.data?.message || 'Could not load the experience ranking.'
+        );
       } finally {
-        setLoadingScores(false);
+        if (!cancelled) setLoadingScores(false);
       }
     };
 
     fetchFacultyScores();
-  }, [schedule.subject, schedule.subjectData]);
+    return () => { cancelled = true; };
+  }, [subjectId, subjectCode, subjectName]);
+
+  // Hooks must run before this, or the hook order changes between renders.
+  if (!schedule) return null;
+
+  // Use _id for saved schedules, tempId for pending
+  const scheduleId = isSaved ? schedule._id : schedule.tempId;
 
   const code = schedule.subjectData?.subjectCode;
   const headerColor = getSubjectColor(code);
@@ -112,14 +121,25 @@ const EditScheduleModal = ({ schedule, faculty, rooms, onUpdate, onClose, onSave
   const duration = getDuration();
   const isReady = !!schedule.faculty && !!schedule.room;
 
-    // Sort faculty by AI score (highest first)
-  const sortedFaculty = React.useMemo(() => {
+  /*
+   * Order the dropdown by the server's ranking.
+   *
+   * Faculty the ranking didn't return (not qualified for this subject's program)
+   * keep their place at the bottom rather than being hidden, so a manager can
+   * still make a deliberate off-recommendation choice.
+   */
+  const sortedFaculty = useMemo(() => {
     return [...faculty]
       .filter(f => f.isActive && f.user)
       .sort((a, b) => {
-        const scoreA = facultyScores[a._id]?.percentage || 0;
-        const scoreB = facultyScores[b._id]?.percentage || 0;
-        return scoreB - scoreA; // Highest score first
+        const A = facultyScores[String(a._id)];
+        const B = facultyScores[String(b._id)];
+        if (A && B) return A.rank - B.rank;
+        if (A) return -1;
+        if (B) return 1;
+        const nameA = `${a.user.lastName || ''} ${a.user.firstName || ''}`;
+        const nameB = `${b.user.lastName || ''} ${b.user.firstName || ''}`;
+        return nameA.localeCompare(nameB);
       });
   }, [faculty, facultyScores]);
 
@@ -211,16 +231,22 @@ const EditScheduleModal = ({ schedule, faculty, rooms, onUpdate, onClose, onSave
               >
                 <option value="">Select faculty member...</option>
                 {sortedFaculty.map(fac => {
-                  const score = facultyScores[fac._id];
-                  const hasExperience = score && score.experienceYears > 0;
-                  const percentage = score?.percentage || 0;
-                  
+                  const score = facultyScores[String(fac._id)];
+                  const taught = score?.timesTaught || 0;
+
+                  // Only the top-ranked candidates that have actually taught the
+                  // subject get the star. Marking everyone would make it noise.
+                  const star = taught > 0 && score.rank <= 3 ? '⭐ ' : '';
+                  const experience = taught > 0
+                    ? ` — taught ${taught}x${score.lastTaught ? `, last ${score.lastTaught}` : ''}${score.isStale ? ' (dated)' : ''}`
+                    : '';
+
                   return (
-                    <option key={fac._id} value={fac._id}>
-                      {percentage > 0 ? `⭐ ${percentage}% ` : ''}
+                    <option key={fac._id} value={fac._id} title={score?.reason || ''}>
+                      {star}
                       {fac.user.firstName} {fac.user.lastName}
-                      {hasExperience ? ` (${score.experienceYears}y exp)` : ''}
-                      {fac.department ? ` — ${fac.department}` : ''}
+                      {score ? ` · ${score.percentage}% match` : ''}
+                      {experience}
                       {fac.employeeId ? ` [${fac.employeeId}]` : ''}
                     </option>
                   );
@@ -231,10 +257,13 @@ const EditScheduleModal = ({ schedule, faculty, rooms, onUpdate, onClose, onSave
                   <AlertCircle className="w-3 h-3" /> Faculty is required
                 </p>
               )}
-              {Object.keys(facultyScores).length > 0 && (
-                <p className="text-xs text-purple-600 dark:text-purple-400 mt-1.5 flex items-center gap-1">
-                  <Sparkles className="w-3 h-3" />
-                  AI-ranked by teaching experience • ⭐ = Best match • (Xy exp) = Years teaching this subject
+              {/* Say what the ranking is based on. When nobody has taught the
+                  subject before it falls back to specialization, workload and
+                  qualifications, and the manager should know that. */}
+              {rankingNote && !loadingScores && (
+                <p className="text-xs text-purple-600 dark:text-purple-400 mt-1.5 flex items-start gap-1">
+                  <Sparkles className="w-3 h-3 flex-shrink-0 mt-0.5" />
+                  <span>{rankingNote}</span>
                 </p>
               )}
             </div>

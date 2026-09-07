@@ -1,5 +1,7 @@
 const mongoose = require('mongoose');
 
+const { programFieldValidator } = require('../utils/programValidator');
+
 const SectionSchema = new mongoose.Schema({
   sectionCode: {
     type: String,
@@ -18,7 +20,8 @@ const SectionSchema = new mongoose.Schema({
   program: {
     type: String,
     required: [true, 'Program is required'],
-    enum: ['BSIT', 'BSHM', 'BIT-ET', 'BIT-CT', 'BIT-AT', 'BSFI', 'BSIE']
+    trim: true,
+    validate: programFieldValidator()
   },
   yearLevel: {
     type: Number,

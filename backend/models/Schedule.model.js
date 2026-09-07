@@ -1,5 +1,7 @@
 const mongoose = require('mongoose');
 
+const { programFieldValidator } = require('../utils/programValidator');
+
 const ScheduleSchema = new mongoose.Schema({
   academicYear: {
     type: String,
@@ -14,7 +16,8 @@ const ScheduleSchema = new mongoose.Schema({
   program: {
     type: String,
     required: [true, 'Program is required'],
-    enum: ['BSIT', 'BSHM', 'BIT-ET', 'BIT-CT', 'BIT-AT', 'BSFI', 'BSIE']
+    trim: true,
+    validate: programFieldValidator()
   },
   yearLevel: {
     type: Number,
@@ -30,8 +33,10 @@ const ScheduleSchema = new mongoose.Schema({
   sectionCode: {
     type: String,
     required: true,
-    unique: true,
     trim: true
+    // NOT unique: a section has one schedule row per subject it takes.
+    // The live index is non-unique and 16 rows already share BSIT-4A-D;
+    // declaring unique here would make syncIndexes() try to enforce it and fail.
   },
   shift: {
     type: String,

@@ -1,8 +1,18 @@
 import React from 'react';
 import { X, User, Mail, Phone, Award, BookOpen, TrendingUp, Calendar, Edit2 } from 'lucide-react';
+import {
+  summarizeAllSubjects,
+  describeRecency,
+  currentAcademicYearStart,
+  formatAcademicYear,
+  STALE_AFTER_YEARS,
+} from '../utils/teachingExperience';
 
 const FacultyDetailsModal = ({ faculty, onClose, onEdit }) => {
   if (!faculty) return null;
+
+  // Grouped by subject, most experienced first (recent teaching weighted higher)
+  const subjectExperience = summarizeAllSubjects(faculty);
 
   return (
     <div className="fixed inset-0 z-50 overflow-y-auto">
@@ -59,9 +69,14 @@ const FacultyDetailsModal = ({ faculty, onClose, onEdit }) => {
               <div className="bg-purple-50 rounded-lg p-4 text-center">
                 <BookOpen className="w-8 h-8 text-purple-600 mx-auto mb-2" />
                 <p className="text-2xl font-bold text-gray-900">
-                  {faculty.teachingHistory?.length || 0}
+                  {subjectExperience.length}
                 </p>
-                <p className="text-xs text-gray-600">Courses Taught</p>
+                <p className="text-xs text-gray-600">
+                  Distinct Subjects
+                  {faculty.teachingHistory?.length
+                    ? ` · ${faculty.teachingHistory.length} sem`
+                    : ''}
+                </p>
               </div>
             </div>
 
@@ -190,33 +205,114 @@ const FacultyDetailsModal = ({ faculty, onClose, onEdit }) => {
               )}
             </div>
 
-            {/* Teaching History */}
+            {/* Teaching History - grouped by subject, ranked by recency-weighted experience */}
             <div className="mb-6">
-              <h4 className="text-lg font-semibold text-gray-900 mb-4 flex items-center">
-                <Calendar size={20} className="mr-2" />
-                Teaching History
-              </h4>
-              {faculty.teachingHistory && faculty.teachingHistory.length > 0 ? (
-                <div className="space-y-2">
-                  {faculty.teachingHistory.slice(0, 5).map((history, idx) => (
-                    <div key={idx} className="flex items-center justify-between bg-gray-50 rounded-lg p-3">
-                      <div className="flex items-center">
-                        <BookOpen size={16} className="text-gray-400 mr-3" />
-                        <span className="text-sm text-gray-900">
-                          {history.subject?.subjectName || 'Unknown Subject'}
-                        </span>
+              <div className="flex items-start justify-between mb-4">
+                <h4 className="text-lg font-semibold text-gray-900 flex items-center">
+                  <Calendar size={20} className="mr-2" />
+                  Subject Experience
+                </h4>
+                <span className="text-xs text-gray-500">
+                  AY {formatAcademicYear(currentAcademicYearStart())}
+                </span>
+              </div>
+
+              {subjectExperience.length > 0 ? (
+                <>
+                  <p className="text-xs text-gray-500 mb-3">
+                    Ordered by experience, with recent teaching weighted more heavily than older
+                    teaching. This is the same ranking the AI uses to recommend instructors.
+                  </p>
+                  <div className="space-y-2">
+                    {subjectExperience.map((s) => (
+                      <div
+                        key={s.key}
+                        className={`rounded-lg p-3 border ${
+                          s.isStale
+                            ? 'bg-amber-50 border-amber-200'
+                            : s.lastTaughtYearsAgo <= 1
+                            ? 'bg-green-50 border-green-200'
+                            : 'bg-gray-50 border-gray-200'
+                        }`}
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="flex items-start min-w-0">
+                            <BookOpen size={16} className="text-gray-400 mr-2 mt-0.5 flex-shrink-0" />
+                            <div className="min-w-0">
+                              <p className="text-sm font-semibold text-gray-900 truncate">
+                                {s.subjectCode || s.subjectName}
+                              </p>
+                              {s.subjectCode && s.subjectName && (
+                                <p className="text-xs text-gray-600 truncate">{s.subjectName}</p>
+                              )}
+                            </div>
+                          </div>
+                          <div className="text-right flex-shrink-0">
+                            <p className="text-sm font-bold text-gray-900">
+                              {s.timesTaught}x taught
+                            </p>
+                            <p
+                              className={`text-xs font-medium ${
+                                s.isStale
+                                  ? 'text-amber-700'
+                                  : s.lastTaughtYearsAgo <= 1
+                                  ? 'text-green-700'
+                                  : 'text-gray-600'
+                              }`}
+                            >
+                              last: {describeRecency(s.lastTaughtYearsAgo)}
+                            </p>
+                          </div>
+                        </div>
+
+                        {/* Per-occurrence timeline */}
+                        <div className="flex flex-wrap gap-1 mt-2">
+                          {s.occurrences.map((o, i) => (
+                            <span
+                              key={i}
+                              title={`${o.semester || ''} ${o.academicYear} · ${describeRecency(o.yearsAgo)}${
+                                o.rating ? ` · rated ${o.rating}/5` : ''
+                              }`}
+                              className={`inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-medium ${
+                                o.yearsAgo === 0
+                                  ? 'bg-green-600 text-white'
+                                  : o.yearsAgo === 1
+                                  ? 'bg-green-200 text-green-900'
+                                  : o.yearsAgo >= STALE_AFTER_YEARS
+                                  ? 'bg-gray-200 text-gray-600'
+                                  : 'bg-blue-100 text-blue-800'
+                              }`}
+                            >
+                              {o.academicYear}
+                            </span>
+                          ))}
+                        </div>
+
+                        <div className="flex items-center gap-3 mt-2 text-xs text-gray-600">
+                          <span>
+                            Experience score:{' '}
+                            <strong className="text-gray-900">
+                              {s.weightedExperience.toFixed(2)}
+                            </strong>
+                          </span>
+                          {s.avgRating && (
+                            <span>
+                              Rating:{' '}
+                              <strong className="text-gray-900">
+                                {s.avgRating.toFixed(1)}/5
+                              </strong>
+                            </span>
+                          )}
+                          {s.isStale && (
+                            <span className="text-amber-700 font-medium">
+                              Dated ({STALE_AFTER_YEARS}+ yrs)
+                            </span>
+                          )}
+                        </div>
                       </div>
-                      <span className="text-xs text-gray-500">
-                        {history.academicYear} - Sem {history.semester}
-                      </span>
-                    </div>
-                  ))}
-                  {faculty.teachingHistory.length > 5 && (
-                    <p className="text-xs text-gray-500 text-center pt-2">
-                      +{faculty.teachingHistory.length - 5} more courses
-                    </p>
-                  )}
-                </div>
+                    ))}
+                  </div>
+                </>
               ) : (
                 <p className="text-sm text-gray-500 italic">No teaching history recorded</p>
               )}

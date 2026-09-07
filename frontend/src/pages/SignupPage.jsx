@@ -1,20 +1,22 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { Mail, Lock, Eye, EyeOff, ArrowLeft, User, Calendar, Brain, Users } from 'lucide-react';
 import toast from 'react-hot-toast';
 import ctuLogo from '../assets/images/logos/ctulogo.png';
 import ctuBg from '../assets/images/backgrounds/ctu-bg.png';
+import { usePrograms } from '../hooks/usePrograms';
 
 const SignupPage = () => {
   const navigate = useNavigate();
   const { isAuthenticated } = useAuth();
+  const { programs } = usePrograms();
   const [formData, setFormData] = useState({
     firstName: '',
     lastName: '',
     studentId: '',
     email: '',
-    program: 'BSIT',
+    program: '',
     password: '',
     confirmPassword: ''
   });
@@ -37,6 +39,16 @@ const SignupPage = () => {
     }, 500);
     return () => clearTimeout(timer);
   }, []);
+
+  // Default the program selection to the first program from the database,
+  // and reset it if the current pick is no longer an active program.
+  useEffect(() => {
+    if (programs.length === 0) return;
+    const codes = programs.map(p => p.code);
+    if (!codes.includes(formData.program)) {
+      setFormData(prev => ({ ...prev, program: codes[0] }));
+    }
+  }, [programs, formData.program]);
 
   // Redirect if already authenticated
   React.useEffect(() => {
@@ -354,13 +366,11 @@ const SignupPage = () => {
                 onChange={handleChange}
                 className="block w-full px-3 py-2.5 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all bg-white"
               >
-                <option value="BSIT">BSIT</option>
-                <option value="BSHM">BSHM</option>
-                <option value="BIT-ET">BIT-ET</option>
-                <option value="BIT-CT">BIT-CT</option>
-                <option value="BIT-AT">BIT-AT</option>
-                <option value="BSFI">BSFI</option>
-                <option value="BSIE">BSIE</option>
+                {programs.map(prog => (
+                  <option key={prog._id} value={prog.code}>
+                    {prog.code} - {prog.name}
+                  </option>
+                ))}
               </select>
             </div>
 

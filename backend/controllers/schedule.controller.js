@@ -3,6 +3,25 @@ const Faculty = require('../models/Faculty.model');
 const Subject = require('../models/Subject.model');
 const Room = require('../models/Room.model');
 const { validationResult } = require('express-validator');
+const {
+  ensureClassSpaceForSchedule,
+  ensureClassSpacesForSchedules,
+  syncClassSpaceForSchedule,
+  deactivateClassSpaceForSchedule,
+} = require('../services/classSpace.service');
+const {
+  attachScheduleRoomLabels,
+  loadRoomsByRawValues,
+  labelFor,
+} = require('../utils/roomLabel');
+// One subject for one section in one term is ONE Schedule document holding all
+// of its meeting times, so it maps to exactly one class space.
+const {
+  groupRowsByOffering,
+  mergeTimeSlots,
+  findExistingOffering,
+  appendSlotsToOffering,
+} = require('../services/scheduleOffering.service');
 
 // @desc    Get all schedules
 // @route   GET /api/schedules
@@ -14,6 +33,9 @@ exports.getAllSchedules = async (req, res) => {
       semester, 
       program, 
       yearLevel,
+      section,
+      sectionCode,
+      shift,
       status,
       faculty,
       search
@@ -43,6 +65,13 @@ exports.getAllSchedules = async (req, res) => {
       if (status) query.status = status;
       if (faculty) query.faculty = faculty;
 
+      // Section and shift were previously ignored, so the schedule builder
+      // received every section of the year level. That made the grid look fully
+      // booked with other sections' classes and blocked drops.
+      if (sectionCode) query.sectionCode = sectionCode.toUpperCase();
+      if (section) query.section = section;
+      if (shift) query.shift = shift;
+
       if (search) {
         query.$or = [
           { sectionCode: { $regex: search, $options: 'i' } },
@@ -52,16 +81,21 @@ exports.getAllSchedules = async (req, res) => {
     }
 
     const schedules = await Schedule.find(query)
-      .populate('subject', 'subjectCode subjectName units')
-      .populate('faculty', 'employeeId')
+      .populate('subject', 'subjectCode subjectName units lectureHours labHours')
       .populate({
         path: 'faculty',
+        select: 'employeeId',
         populate: {
           path: 'user',
           select: 'firstName lastName'
         }
       })
-      .sort({ program: 1, yearLevel: 1, section: 1 });
+      .sort({ program: 1, yearLevel: 1, section: 1 })
+      .lean();
+
+    // `room` holds a Room id in a String field, so it can't be populated.
+    // Resolve it to a display label instead of leaking the raw id to the UI.
+    await attachScheduleRoomLabels(schedules);
 
     res.status(200).json({
       success: true,
@@ -137,6 +171,7 @@ exports.createSchedule = async (req, res) => {
       yearLevel,
       section,
       sectionCode,
+      shift,
       subject,
       faculty,
       room,
@@ -162,13 +197,34 @@ exports.createSchedule = async (req, res) => {
       });
     }
 
+    // Is this subject already scheduled for this section? If so this request is
+    // another meeting time for the SAME class, not a second class. Creating a
+    // second document here is what produced duplicate "My Classes" cards.
+    const existing = await findExistingOffering({ subject, sectionCode, academicYear, semester });
+
+    if (existing) {
+      const sameFaculty = String(existing.faculty) === String(faculty);
+      const sameRoom = String(existing.room) === String(room);
+      if (!sameFaculty || !sameRoom) {
+        return res.status(400).json({
+          success: false,
+          message: `${subjectExists.subjectCode} is already scheduled for ${sectionCode} with a different `
+            + `${!sameFaculty ? 'instructor' : 'room'}. Update that class instead of creating another one.`,
+          data: existing
+        });
+      }
+    }
+
     // Check for conflicts
     const conflicts = await checkScheduleConflicts({
       faculty,
       room,
+      sectionCode,
       timeSlots,
       academicYear,
-      semester
+      semester,
+      // Adding a meeting time to an existing class must not clash with itself
+      excludeScheduleId: existing?._id
     });
 
     if (conflicts.hasConflict) {
@@ -179,27 +235,40 @@ exports.createSchedule = async (req, res) => {
       });
     }
 
-    // Create schedule
-    const schedule = await Schedule.create({
-      academicYear,
-      semester,
-      program,
-      yearLevel,
-      section,
-      sectionCode,
-      subject,
-      faculty,
-      room,
-      timeSlots,
-      maxStudents: maxStudents || 40,
-      generatedBy: 'manual'
-    });
+    let schedule;
 
-    // Update faculty load
-    const subjectUnits = subjectExists.units;
-    await Faculty.findByIdAndUpdate(faculty, {
-      $inc: { currentLoad: subjectUnits }
-    });
+    if (existing) {
+      // Faculty load stays as it is: the offering was counted when it was first
+      // created, and another meeting time is not another subject.
+      schedule = await appendSlotsToOffering(existing, timeSlots);
+    } else {
+      // `shift` must be passed explicitly: it was previously omitted here, so the
+      // schema default of 'Day' was applied and every Night section was stored as Day.
+      schedule = await Schedule.create({
+        academicYear,
+        semester,
+        program,
+        yearLevel,
+        section,
+        sectionCode,
+        shift: shift || 'Day',
+        subject,
+        faculty,
+        room,
+        timeSlots: mergeTimeSlots(timeSlots),
+        maxStudents: maxStudents || 40,
+        generatedBy: 'manual'
+      });
+
+      // Update faculty load
+      await Faculty.findByIdAndUpdate(faculty, {
+        $inc: { currentLoad: subjectExists.units }
+      });
+    }
+
+    // Every subject offering gets its class space, so the teacher can post and
+    // students of the section are pulled in automatically.
+    await ensureClassSpaceForSchedule(schedule);
 
     await schedule.populate([
       { path: 'subject', select: 'subjectCode subjectName units' },
@@ -208,7 +277,10 @@ exports.createSchedule = async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: 'Schedule created successfully',
+      message: existing
+        ? 'Meeting time added to the existing class'
+        : 'Schedule created successfully',
+      merged: !!existing,
       data: schedule
     });
 
@@ -245,11 +317,16 @@ exports.updateSchedule = async (req, res) => {
       notes
     } = req.body;
 
-    // If changing faculty or time slots, check for conflicts
-    if ((faculty && faculty !== schedule.faculty.toString()) || timeSlots) {
+    // Re-check conflicts whenever anything that can clash changes.
+    // Room was previously not a trigger, so moving a class into an occupied room
+    // was accepted silently.
+    const facultyChanged = faculty && faculty !== schedule.faculty.toString();
+    const roomChanged = room && String(room) !== String(schedule.room);
+    if (facultyChanged || roomChanged || timeSlots) {
       const conflicts = await checkScheduleConflicts({
         faculty: faculty || schedule.faculty,
         room: room || schedule.room,
+        sectionCode: schedule.sectionCode,
         timeSlots: timeSlots || schedule.timeSlots,
         academicYear: schedule.academicYear,
         semester: schedule.semester,
@@ -291,6 +368,11 @@ exports.updateSchedule = async (req, res) => {
     if (notes !== undefined) schedule.notes = notes;
 
     await schedule.save();
+
+    // The class space denormalises faculty for the "classes I teach" query, so a
+    // reassignment here has to be mirrored or the old teacher keeps the class.
+    await syncClassSpaceForSchedule(schedule);
+
     await schedule.populate([
       { path: 'subject', select: 'subjectCode subjectName units' },
       { path: 'faculty', populate: { path: 'user', select: 'firstName lastName' } }
@@ -336,6 +418,11 @@ exports.deleteSchedule = async (req, res) => {
     schedule.isActive = false;
     await schedule.save();
 
+    // The class space has to go with it. It was left active before, so a deleted
+    // class kept appearing in the students' and teacher's class list with no way
+    // to remove it, and syncSectionEnrollment kept re-enrolling students.
+    await deactivateClassSpaceForSchedule(schedule);
+
     res.status(200).json({
       success: true,
       message: 'Schedule deleted successfully'
@@ -355,6 +442,7 @@ exports.deleteSchedule = async (req, res) => {
 async function checkScheduleConflicts({
   faculty,
   room,
+  sectionCode,
   timeSlots,
   academicYear,
   semester,
@@ -364,6 +452,10 @@ async function checkScheduleConflicts({
     hasConflict: false,
     details: []
   };
+
+  if (!Array.isArray(timeSlots) || timeSlots.length === 0) {
+    return conflicts;
+  }
 
   // Build base query
   let query = {
@@ -378,50 +470,94 @@ async function checkScheduleConflicts({
 
   // Get all schedules for the same semester
   const existingSchedules = await Schedule.find(query)
-    .populate('faculty', 'employeeId')
     .populate({
       path: 'faculty',
+      select: 'employeeId',
       populate: { path: 'user', select: 'firstName lastName' }
-    });
+    })
+    .populate('subject', 'subjectCode')
+    .lean();
 
-  // Check each time slot for conflicts
+  // Resolve room ids so the message names the room instead of an id
+  const roomsById = await loadRoomsByRawValues([
+    room,
+    ...existingSchedules.map(s => s.room)
+  ]);
+  const roomLabel = (raw) => labelFor(roomsById.get(String(raw))) || raw;
+
+  // Avoid reporting the same clash once per overlapping hour
+  const seen = new Set();
+  const add = (detail) => {
+    const fingerprint = `${detail.type}|${detail.day}|${detail.time}|${detail.conflictingSchedule}`;
+    if (seen.has(fingerprint)) return;
+    seen.add(fingerprint);
+    conflicts.hasConflict = true;
+    conflicts.details.push(detail);
+  };
+
   for (const newSlot of timeSlots) {
     for (const existingSchedule of existingSchedules) {
-      for (const existingSlot of existingSchedule.timeSlots) {
-        // Same day check
-        if (newSlot.day === existingSlot.day) {
-          const hasTimeOverlap = checkTimeOverlap(
-            newSlot.startTime,
-            newSlot.endTime,
-            existingSlot.startTime,
-            existingSlot.endTime
-          );
+      for (const existingSlot of existingSchedule.timeSlots || []) {
+        if (newSlot.day !== existingSlot.day) continue;
 
-          if (hasTimeOverlap) {
-            // Faculty conflict
-            if (faculty && existingSchedule.faculty._id.toString() === faculty.toString()) {
-              conflicts.hasConflict = true;
-              conflicts.details.push({
-                type: 'faculty',
-                message: `Faculty ${existingSchedule.faculty.user.firstName} ${existingSchedule.faculty.user.lastName} is already scheduled`,
-                day: newSlot.day,
-                time: `${existingSlot.startTime} - ${existingSlot.endTime}`,
-                conflictingSchedule: existingSchedule.sectionCode
-              });
-            }
+        const hasTimeOverlap = checkTimeOverlap(
+          newSlot.startTime,
+          newSlot.endTime,
+          existingSlot.startTime,
+          existingSlot.endTime
+        );
+        if (!hasTimeOverlap) continue;
 
-            // Room conflict
-            if (room && existingSchedule.room === room) {
-              conflicts.hasConflict = true;
-              conflicts.details.push({
-                type: 'room',
-                message: `Room ${room} is already occupied`,
-                day: newSlot.day,
-                time: `${existingSlot.startTime} - ${existingSlot.endTime}`,
-                conflictingSchedule: existingSchedule.sectionCode
-              });
-            }
-          }
+        const time = `${existingSlot.startTime} - ${existingSlot.endTime}`;
+        const against = existingSchedule.subject?.subjectCode
+          ? `${existingSchedule.sectionCode} (${existingSchedule.subject.subjectCode})`
+          : existingSchedule.sectionCode;
+
+        // Faculty double-booking.
+        // `faculty` may be null if the referenced Faculty document was deleted,
+        // so read the id defensively rather than through `.faculty._id`.
+        const existingFacultyId = existingSchedule.faculty?._id || existingSchedule.faculty;
+        if (faculty && existingFacultyId && existingFacultyId.toString() === faculty.toString()) {
+          const name = existingSchedule.faculty?.user
+            ? `${existingSchedule.faculty.user.firstName} ${existingSchedule.faculty.user.lastName}`
+            : 'This instructor';
+          add({
+            type: 'faculty',
+            message: `${name} is already teaching ${against} at this time`,
+            day: newSlot.day,
+            time,
+            conflictingSchedule: existingSchedule.sectionCode
+          });
+        }
+
+        // Room double-booking
+        if (room && existingSchedule.room && String(existingSchedule.room) === String(room)) {
+          add({
+            type: 'room',
+            message: `Room ${roomLabel(room)} is already used by ${against} at this time`,
+            day: newSlot.day,
+            time,
+            conflictingSchedule: existingSchedule.sectionCode
+          });
+        }
+
+        // Section double-booking. This was previously not checked at all, so a
+        // section could be given two subjects in the same hour as long as the
+        // faculty and room differed.
+        if (
+          sectionCode &&
+          existingSchedule.sectionCode &&
+          String(existingSchedule.sectionCode).toUpperCase() === String(sectionCode).toUpperCase()
+        ) {
+          add({
+            type: 'section',
+            message: `Section ${existingSchedule.sectionCode} already has ${
+              existingSchedule.subject?.subjectCode || 'a class'
+            } at this time`,
+            day: newSlot.day,
+            time,
+            conflictingSchedule: existingSchedule.sectionCode
+          });
         }
       }
     }
@@ -555,8 +691,15 @@ exports.checkConflicts = async (req, res) => {
       if (yearLevel) query.yearLevel = yearLevel;
       
       const schedules = await Schedule.find(query)
-        .populate('faculty', 'employeeId')
-        .populate({ path: 'faculty', populate: { path: 'user', select: 'firstName lastName' } });
+        .populate({
+          path: 'faculty',
+          select: 'employeeId',
+          populate: { path: 'user', select: 'firstName lastName' }
+        })
+        .populate('subject', 'subjectCode')
+        .lean();
+
+      await attachScheduleRoomLabels(schedules);
 
       const allConflicts = [];
 
@@ -578,12 +721,18 @@ exports.checkConflicts = async (req, res) => {
                 );
 
                 if (overlap) {
-                  // Faculty conflict
-                  if (schedule1.faculty && schedule2.faculty &&
-                      schedule1.faculty._id.toString() === schedule2.faculty._id.toString()) {
+                  // Faculty conflict. Read ids defensively: populate yields null
+                  // when the referenced Faculty was deleted, and `.faculty._id`
+                  // on null throws and 500s the whole conflict check.
+                  const f1 = schedule1.faculty?._id || schedule1.faculty;
+                  const f2 = schedule2.faculty?._id || schedule2.faculty;
+                  if (f1 && f2 && f1.toString() === f2.toString()) {
+                    const name = schedule1.faculty?.user
+                      ? `${schedule1.faculty.user.firstName || ''} ${schedule1.faculty.user.lastName || ''}`.trim()
+                      : 'An instructor';
                     allConflicts.push({
                       type: 'faculty',
-                      message: `Faculty ${schedule1.faculty.user?.firstName || ''} ${schedule1.faculty.user?.lastName || ''} has overlapping classes`,
+                      message: `${name} has overlapping classes`,
                       day: slot1.day,
                       time: `${slot1.startTime} - ${slot1.endTime}`,
                       schedule1: schedule1.sectionCode,
@@ -592,10 +741,29 @@ exports.checkConflicts = async (req, res) => {
                   }
 
                   // Room conflict
-                  if (schedule1.room && schedule2.room && schedule1.room === schedule2.room) {
+                  if (schedule1.room && schedule2.room && String(schedule1.room) === String(schedule2.room)) {
                     allConflicts.push({
                       type: 'room',
-                      message: `Room ${schedule1.room} is double-booked`,
+                      message: `Room ${schedule1.roomLabel || schedule1.room} is double-booked`,
+                      day: slot1.day,
+                      time: `${slot1.startTime} - ${slot1.endTime}`,
+                      schedule1: schedule1.sectionCode,
+                      schedule2: schedule2.sectionCode
+                    });
+                  }
+
+                  // Section conflict: the same section cannot sit in two
+                  // classes at once. Previously never checked.
+                  if (
+                    schedule1.sectionCode &&
+                    schedule2.sectionCode &&
+                    String(schedule1.sectionCode).toUpperCase() === String(schedule2.sectionCode).toUpperCase()
+                  ) {
+                    allConflicts.push({
+                      type: 'section',
+                      message: `Section ${schedule1.sectionCode} has two classes at the same time (${
+                        schedule1.subject?.subjectCode || '?'
+                      } and ${schedule2.subject?.subjectCode || '?'})`,
                       day: slot1.day,
                       time: `${slot1.startTime} - ${slot1.endTime}`,
                       schedule1: schedule1.sectionCode,
@@ -726,6 +894,52 @@ exports.batchPublishSchedules = async (req, res) => {
   }
 };
 
+// @desc    Batch delete schedules by IDs
+// @route   POST /api/schedules/batch-delete
+// @access  Private/Admin
+exports.batchDeleteSchedules = async (req, res) => {
+  try {
+    const { ids } = req.body;
+
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No schedule IDs provided for deletion'
+      });
+    }
+
+    const schedules = await Schedule.find({ _id: { $in: ids }, isActive: true })
+      .populate('subject', 'units');
+
+    let deletedCount = 0;
+    for (const schedule of schedules) {
+      if (schedule.faculty && schedule.subject?.units) {
+        await Faculty.findByIdAndUpdate(schedule.faculty, {
+          $inc: { currentLoad: -schedule.subject.units }
+        });
+      }
+      schedule.isActive = false;
+      await schedule.save();
+      await deactivateClassSpaceForSchedule(schedule);
+      deletedCount++;
+    }
+
+    res.status(200).json({
+      success: true,
+      message: `Successfully deleted ${deletedCount} schedule(s)`,
+      count: deletedCount
+    });
+
+  } catch (error) {
+    console.error('Batch delete schedules error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error deleting schedules',
+      error: error.message
+    });
+  }
+};
+
 // @desc    Generate schedule automatically
 // @route   POST /api/schedules/generate
 // @access  Private/Admin
@@ -794,6 +1008,10 @@ exports.generateSchedule = async (req, res) => {
           }
         }
 
+        // One class space per saved offering. Failures here are logged and
+        // counted rather than thrown, so a partial save still succeeds.
+        await ensureClassSpacesForSchedules(savedSchedules);
+
         result.savedSchedules = savedSchedules;
         result.saveErrors = errors;
       }
@@ -815,9 +1033,16 @@ exports.generateSchedule = async (req, res) => {
 
     res.status(200).json({
       success: result.success,
-      message: result.message || (result.success ? 'Schedule generated successfully' : 'Schedule generation failed'),
+      // `result.error` carries the solver's specific reason (a section that is
+      // already full, no lab room, a load cap). Dropping it left the user with
+      // a bare "Schedule generation failed".
+      message: result.message
+        || result.error
+        || (result.success ? 'Schedule generated successfully' : 'Schedule generation failed'),
       method: method === 'ortools' ? 'Google OR-Tools CP-SAT' : 'Greedy Algorithm',
       aiUsed: result.aiUsed || false,
+      blockers: result.blockers || [],
+      diagnostics: result.diagnostics || [],
       data: result
     });
 
@@ -859,22 +1084,31 @@ exports.previewSchedule = async (req, res) => {
 
     // Choose generation method
     if (method === 'ortools') {
-      // OR-Tools preview not yet implemented, fall back to greedy for preview
-      console.log('OR-Tools preview requested, falling back to greedy algorithm for preview');
-      const { previewScheduleForProgram } = require('../services/scheduleGenerator.service');
+      // Previously this silently fell back to the greedy algorithm, so choosing
+      // OR-Tools in the preview dialog produced a greedy timetable and then
+      // saving it ran the solver - a different schedule from the one reviewed.
+      const { previewWithORTools } = require('../services/ortoolsBridge.service');
 
-      preview = await previewScheduleForProgram({
+      const solved = await previewWithORTools({
         academicYear,
         semester,
         program,
         yearLevel,
         section,
         shift,
-        useAIRecommendations: useAIRecommendations === true || useAIRecommendations === 'true'
+        timeLimit,
       });
-      
-      // Override method name for display
-      preview.methodNote = 'Preview generated using Greedy Algorithm (OR-Tools preview not yet implemented)';
+
+      preview = {
+        ...solved.preview,
+        success: solved.success,
+        message: solved.message,
+        status: solved.status,
+        blockers: solved.blockers || [],
+        diagnostics: solved.diagnostics || [],
+        skipped: solved.skipped || [],
+        methodNote: 'Preview generated with Google OR-Tools CP-SAT',
+      };
     } else {
       // Use greedy algorithm - preview only
       const { previewScheduleForProgram } = require('../services/scheduleGenerator.service');
@@ -925,9 +1159,22 @@ exports.savePreviewedSchedules = async (req, res) => {
     const savedSchedules = [];
     const errors = [];
 
-    for (const scheduleData of schedules) {
+    // Fold rows belonging to the same subject offering together, so a preview
+    // that lists a subject's meetings separately still saves as one class.
+    const { groups, errors: groupErrors } = groupRowsByOffering(schedules);
+    errors.push(...groupErrors.map(e => ({ subject: e.subject, error: e.error })));
+
+    for (const group of groups) {
+      const scheduleData = group.merged;
       try {
-        // Create schedule in database
+        const existing = await findExistingOffering(scheduleData);
+
+        if (existing) {
+          // Already scheduled: add the meeting times, leave faculty load alone.
+          savedSchedules.push(await appendSlotsToOffering(existing, scheduleData.timeSlots));
+          continue;
+        }
+
         const schedule = await Schedule.create(scheduleData);
         savedSchedules.push(schedule);
 
@@ -942,17 +1189,22 @@ exports.savePreviewedSchedules = async (req, res) => {
         }
       } catch (error) {
         errors.push({
-          subject: scheduleData.metadata?.subjectCode || 'Unknown',
+          subject: scheduleData.metadata?.subjectCode || scheduleData.subjectCode || 'Unknown',
           error: error.message
         });
       }
     }
+
+    // One class space per saved offering, so the classes appear for the
+    // teacher and the section's students without any extra step.
+    const spaces = await ensureClassSpacesForSchedules(savedSchedules);
 
     res.status(201).json({
       success: true,
       message: `Successfully saved ${savedSchedules.length} schedule(s)`,
       saved: savedSchedules.length,
       failed: errors.length,
+      classSpacesCreated: spaces.created,
       data: savedSchedules,
       errors: errors
     });
@@ -984,6 +1236,272 @@ exports.checkORToolsStatus = async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Error checking OR-Tools status',
+      error: error.message
+    });
+  }
+};
+
+// @desc    Create many schedules in one request (schedule builder "Save All")
+// @route   POST /api/schedules/bulk
+// @access  Private/Admin
+//
+// The builder used to POST one schedule per row in a loop. If row 3 of 8 failed,
+// rows 1-2 were already persisted but the client still held all 8 as pending, so
+// pressing Save All again created duplicates and double-counted faculty load.
+//
+// This validates every row first and only writes if all of them pass, so the
+// client can safely clear its pending list on success and keep it on failure.
+exports.bulkCreateSchedules = async (req, res) => {
+  try {
+    const { schedules } = req.body;
+
+    if (!Array.isArray(schedules) || schedules.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'A non-empty schedules array is required'
+      });
+    }
+
+    const MAX_ROWS = 200;
+    if (schedules.length > MAX_ROWS) {
+      return res.status(400).json({
+        success: false,
+        message: `Too many schedules in one request (max ${MAX_ROWS})`
+      });
+    }
+
+    // ---------- 1. validate every row before writing anything ----------
+    const errors = [];
+    const prepared = [];
+
+    // Cache lookups so N rows don't mean N identical queries
+    const subjectCache = new Map();
+    const facultyCache = new Map();
+
+    for (let i = 0; i < schedules.length; i++) {
+      const row = schedules[i];
+      const label = row?.subjectCode || `row ${i + 1}`;
+
+      const required = ['subject', 'faculty', 'room', 'program', 'yearLevel', 'section', 'sectionCode', 'semester', 'academicYear'];
+      const missing = required.filter(k => row?.[k] === undefined || row?.[k] === null || row?.[k] === '');
+      if (missing.length > 0) {
+        errors.push({ index: i, subject: label, error: `Missing: ${missing.join(', ')}` });
+        continue;
+      }
+
+      if (!Array.isArray(row.timeSlots) || row.timeSlots.length === 0) {
+        errors.push({ index: i, subject: label, error: 'At least one time slot is required' });
+        continue;
+      }
+
+      if (!subjectCache.has(String(row.subject))) {
+        subjectCache.set(String(row.subject), await Subject.findById(row.subject).select('units subjectCode').lean());
+      }
+      const subjectDoc = subjectCache.get(String(row.subject));
+      if (!subjectDoc) {
+        errors.push({ index: i, subject: label, error: 'Subject not found' });
+        continue;
+      }
+
+      if (!facultyCache.has(String(row.faculty))) {
+        facultyCache.set(String(row.faculty), await Faculty.findById(row.faculty).select('_id').lean());
+      }
+      if (!facultyCache.get(String(row.faculty))) {
+        errors.push({ index: i, subject: label, error: 'Faculty not found' });
+        continue;
+      }
+
+      prepared.push({ index: i, label, subjectDoc, row });
+    }
+
+    // ---------- 1b. fold blocks of the same offering into one row ----------
+    // The builder places a class cell by cell, so a 4-hour lab arrives as
+    // several rows. Written as-is they became several Schedule documents and
+    // therefore several class spaces for one subject. One offering = one row
+    // carrying all of its meeting times.
+    const { groups, errors: groupErrors } = groupRowsByOffering(
+      prepared.map(p => ({ ...p.row, index: p.index, label: p.label }))
+    );
+    errors.push(...groupErrors);
+
+    const offerings = [];
+    for (const group of groups) {
+      const row = group.merged;
+      const label = row.label;
+      const index = row.index;
+      const subjectDoc = subjectCache.get(String(row.subject));
+
+      // The offering may already be saved - a later drop extends it rather than
+      // starting a second copy of the same class.
+      const existing = await findExistingOffering(row);
+
+      if (existing) {
+        const sameFaculty = String(existing.faculty) === String(row.faculty);
+        const sameRoom = String(existing.room) === String(row.room);
+        if (!sameFaculty || !sameRoom) {
+          errors.push({
+            index,
+            subject: label,
+            error: `${label} is already scheduled for ${row.sectionCode} with a different `
+              + `${!sameFaculty ? 'instructor' : 'room'}. Edit the existing class instead of adding a second one.`
+          });
+          continue;
+        }
+      }
+
+      offerings.push({ index, label, row, subjectDoc, existing });
+    }
+
+    // ---------- 2. conflicts against saved rows AND within this batch ----------
+    for (const item of offerings) {
+      const { row, index, label, existing } = item;
+
+      const conflicts = await checkScheduleConflicts({
+        faculty: row.faculty,
+        room: row.room,
+        sectionCode: row.sectionCode,
+        timeSlots: row.timeSlots,
+        academicYear: row.academicYear,
+        semester: row.semester,
+        // Extending an offering must not clash with itself
+        excludeScheduleId: existing?._id
+      });
+
+      if (conflicts.hasConflict) {
+        errors.push({
+          index,
+          subject: label,
+          error: conflicts.details[0]?.message || 'Schedule conflict',
+          conflicts: conflicts.details
+        });
+      }
+    }
+
+    // Within-batch clashes never hit the DB check, since none of these rows are
+    // saved yet. Compare each pair directly.
+    for (let a = 0; a < offerings.length; a++) {
+      for (let b = a + 1; b < offerings.length; b++) {
+        const A = offerings[a].row;
+        const B = offerings[b].row;
+        if (A.academicYear !== B.academicYear || String(A.semester) !== String(B.semester)) continue;
+
+        for (const sa of A.timeSlots) {
+          for (const sb of B.timeSlots) {
+            if (sa.day !== sb.day) continue;
+            if (!checkTimeOverlap(sa.startTime, sa.endTime, sb.startTime, sb.endTime)) continue;
+
+            const where = `${sa.day} ${sa.startTime}`;
+            if (String(A.faculty) === String(B.faculty)) {
+              errors.push({
+                index: offerings[b].index,
+                subject: offerings[b].label,
+                error: `Same instructor as ${offerings[a].label} at ${where}`
+              });
+            }
+            if (String(A.room) === String(B.room)) {
+              errors.push({
+                index: offerings[b].index,
+                subject: offerings[b].label,
+                error: `Same room as ${offerings[a].label} at ${where}`
+              });
+            }
+            if (String(A.sectionCode).toUpperCase() === String(B.sectionCode).toUpperCase()) {
+              errors.push({
+                index: offerings[b].index,
+                subject: offerings[b].label,
+                error: `Section already has ${offerings[a].label} at ${where}`
+              });
+            }
+          }
+        }
+      }
+    }
+
+    // ---------- 3. all-or-nothing ----------
+    if (errors.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `${errors.length} schedule(s) could not be saved. Nothing was written.`,
+        saved: 0,
+        failed: errors.length,
+        errors
+      });
+    }
+
+    const created = [];
+    let extended = 0;
+
+    for (const { row, subjectDoc, existing } of offerings) {
+      if (existing) {
+        // Extend the class that is already there. Faculty load is untouched:
+        // giving a subject another meeting time does not add a subject to the
+        // teacher's load, and it was counted when the offering was created.
+        await appendSlotsToOffering(existing, row.timeSlots);
+        created.push(existing);
+        extended++;
+        continue;
+      }
+
+      const schedule = await Schedule.create({
+        academicYear: row.academicYear,
+        semester: row.semester,
+        program: row.program,
+        yearLevel: row.yearLevel,
+        section: row.section,
+        sectionCode: row.sectionCode,
+        shift: row.shift || 'Day',
+        subject: row.subject,
+        faculty: row.faculty,
+        room: row.room,
+        timeSlots: row.timeSlots,
+        maxStudents: row.maxStudents || 40,
+        generatedBy: 'manual'
+      });
+
+      await Faculty.findByIdAndUpdate(row.faculty, { $inc: { currentLoad: subjectDoc.units } });
+      created.push(schedule);
+    }
+
+    // Each subject offering gets its class space so the teacher can post and the
+    // section's students are enrolled automatically.
+    const spaces = await ensureClassSpacesForSchedules(created);
+
+    const populated = await Schedule.find({ _id: { $in: created.map(c => c._id) } })
+      .populate('subject', 'subjectCode subjectName units')
+      .populate({
+        path: 'faculty',
+        select: 'employeeId',
+        populate: { path: 'user', select: 'firstName lastName' }
+      })
+      .lean();
+
+    await attachScheduleRoomLabels(populated);
+
+    // Blocks of the same subject collapse into one class, so the number of
+    // classes saved is usually smaller than the number of blocks drawn. Say so,
+    // otherwise the count looks like rows were silently dropped.
+    const blocks = prepared.length;
+    const classes = created.length;
+    let message = `Saved ${classes} class${classes === 1 ? '' : 'es'}`;
+    if (blocks > classes) message += ` from ${blocks} blocks`;
+    if (extended > 0) message += ` (${extended} added to an existing class)`;
+
+    res.status(201).json({
+      success: true,
+      message,
+      saved: classes,
+      blocks,
+      extended,
+      failed: 0,
+      classSpacesCreated: spaces.created,
+      data: populated
+    });
+
+  } catch (error) {
+    console.error('Bulk create schedules error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error saving schedules',
       error: error.message
     });
   }

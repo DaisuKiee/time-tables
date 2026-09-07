@@ -7,6 +7,7 @@ import {
   Users, BookOpen, X, Check, GraduationCap,
   Calendar, UserCheck, TrendingUp, Grid3x3, List, RefreshCw, Copy
 } from 'lucide-react';
+import { usePrograms } from '../hooks/usePrograms';
 
 const SectionPage = () => {
   const [sections, setSections] = useState([]);
@@ -33,7 +34,7 @@ const SectionPage = () => {
     description: ''
   });
 
-  const programs = ['BSIT', 'BSHM', 'BIT-ET', 'BIT-CT', 'BIT-AT', 'BSFI', 'BSIE'];
+  const { programCodes: programs } = usePrograms();
   const yearLevels = [1, 2, 3, 4];
   const sectionLetters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
   const shifts = ['Day', 'Night'];

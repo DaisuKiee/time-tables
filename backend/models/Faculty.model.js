@@ -45,6 +45,10 @@ const FacultySchema = new mongoose.Schema({
     type: String,
     trim: true
   }],
+  programs: [{
+    type: String,
+    trim: true
+  }],
   teachingHistory: [{
     subjectCode: String,
     subjectName: String,

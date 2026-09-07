@@ -1,5 +1,7 @@
 const mongoose = require('mongoose');
 
+const { programFieldValidator } = require('../utils/programValidator');
+
 const StudentSchema = new mongoose.Schema({
   user: {
     type: mongoose.Schema.Types.ObjectId,
@@ -16,7 +18,8 @@ const StudentSchema = new mongoose.Schema({
   program: {
     type: String,
     required: [true, 'Program is required'],
-    enum: ['BSIT', 'BSHM', 'BIT-ET', 'BIT-CT', 'BIT-AT', 'BSFI', 'BSIE']
+    trim: true,
+    validate: programFieldValidator()
   },
   studentType: {
     type: String,

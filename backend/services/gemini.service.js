@@ -1,5 +1,10 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { GoogleGenAI } = require('@google/genai');
+const {
+  summarizeAllSubjects,
+  currentAcademicYearStart,
+  formatAcademicYear,
+} = require('../utils/teachingExperience');
 
 // Load all 5 API keys from environment
 const API_KEYS = [
@@ -71,11 +76,20 @@ const markKeyAsFailed = (keyIndex) => {
  * System prompt for RAG-based timetabling assistant with multilingual support
  */
 const getSystemPrompt = (context = {}) => {
-  const { schedules = [], subjects = [], faculty = [], rooms = [], sections = [], stats = {} } = context;
+  const { schedules = [], subjects = [], faculty = [], rooms = [], sections = [], programs = [], stats = {} } = context;
 
-  // SYSTEM-DEFINED PROGRAMS (from models/Subject.model.js)
-  const SYSTEM_PROGRAMS = ['BSIT', 'BSHM', 'BIT-ET', 'BIT-CT', 'BIT-AT', 'BSFI', 'BSIE'];
-  
+  // Program codes come from the `programs` collection via loadRAGContext().
+  // Fall back to whatever programs appear on subjects if the list is missing.
+  const SYSTEM_PROGRAMS = programs.length > 0
+    ? programs.map(p => p.code)
+    : [...new Set(subjects.map(s => s.program))].filter(p => p && p !== 'General');
+
+  // Full names keyed by code, for richer answers
+  const PROGRAM_NAMES = programs.reduce((acc, p) => {
+    acc[p.code] = p.name;
+    return acc;
+  }, {});
+
   // Extract programs that have subjects in database
   const programsWithData = [...new Set(subjects.map(s => s.program))].filter(Boolean);
   
@@ -122,40 +136,41 @@ const getSystemPrompt = (context = {}) => {
     );
     
     if (facultyWithHistory.length > 0) {
-      teachingHistoryDetails = '\n\n**🎓 FACULTY TEACHING HISTORY DATABASE:**\n' +
-        '(Complete record of who taught what)\n\n';
-      
+      teachingHistoryDetails = `\n\n**🎓 FACULTY TEACHING HISTORY DATABASE (current academic year: ${formatAcademicYear(currentAcademicYearStart())}):**\n` +
+        '(Who taught what, HOW MANY TIMES, and HOW RECENTLY)\n' +
+        '"recency-weighted score" already discounts old experience: an occurrence in\n' +
+        'the current year counts 1.00, last year 0.85, and 5+ years ago only 0.25.\n' +
+        'A HIGHER recency-weighted score means a STRONGER candidate for that subject.\n\n';
+
       facultyWithHistory.slice(0, 20).forEach(f => {
-        const history = f.teachingHistory || [];
         teachingHistoryDetails += `**${f.fullName}** (${f.employeeId}):\n`;
-        
-        // Group by subject code
-        const bySubject = {};
-        history.forEach(h => {
-          const key = h.subjectCode || h.subjectName;
-          if (key) {
-            if (!bySubject[key]) {
-              bySubject[key] = [];
-            }
-            bySubject[key].push(h);
-          }
-        });
-        
-        Object.entries(bySubject)
-          .sort((a, b) => b[1].length - a[1].length) // Sort by frequency
-          .slice(0, 5) // Show top 5 subjects per faculty
-          .forEach(([subject, records]) => {
-            const semesters = records.map(r => `${r.semester} ${r.academicYear}`).join(', ');
-            const avgRating = records.filter(r => r.rating).length > 0
-              ? (records.reduce((sum, r) => sum + (r.rating || 0), 0) / records.filter(r => r.rating).length).toFixed(1)
-              : 'N/A';
-            
-            teachingHistoryDetails += `  ✓ ${subject} - ${records.length}x taught (${semesters}) - Rating: ${avgRating}/5\n`;
+
+        // Group by subject and rank by recency-weighted experience
+        summarizeAllSubjects(f)
+          .slice(0, 5) // top 5 subjects per faculty
+          .forEach(s => {
+            const label = s.subjectCode || s.subjectName;
+            const when =
+              s.lastTaughtYearsAgo === 0
+                ? 'THIS YEAR'
+                : s.lastTaughtYearsAgo === 1
+                ? 'last year'
+                : `${s.lastTaughtYearsAgo} years ago`;
+            const years = s.occurrences
+              .map(o => `${o.semester || '?'} ${o.academicYear}`)
+              .join('; ');
+            const rating = s.avgRating ? `${s.avgRating.toFixed(1)}/5` : 'N/A';
+
+            teachingHistoryDetails +=
+              `  ✓ ${label} — taught ${s.timesTaught}x, most recently ${when} (${s.lastTaughtAcademicYear})` +
+              ` | recency-weighted score: ${s.weightedExperience.toFixed(2)}` +
+              ` | rating: ${rating}${s.isStale ? ' | ⚠️ DATED (5+ yrs)' : ''}\n` +
+              `      occurrences: ${years}\n`;
           });
-        
+
         teachingHistoryDetails += '\n';
       });
-      
+
       if (facultyWithHistory.length > 20) {
         teachingHistoryDetails += `... and ${facultyWithHistory.length - 20} more faculty with teaching history\n`;
       }
@@ -291,12 +306,13 @@ You have COMPLETE ACCESS to the system's live database. Use ONLY REAL DATA from 
 4. For off-topic questions, redirect: "I'm specialized in the CTU Daanbantayan timetabling system. I can help with schedules, faculty, rooms, and system features."
 
 **🎓 SYSTEM PROGRAMS:**
-The system supports **7 programs**: ${SYSTEM_PROGRAMS.join(', ')}
+The system supports **${SYSTEM_PROGRAMS.length} programs**: ${SYSTEM_PROGRAMS.join(', ')}
 
 **Program Details:**
 ${SYSTEM_PROGRAMS.map(p => {
   const count = subjectsByProgram[p] || 0;
-  return `• **${p}**: ${count > 0 ? `${count} subjects in database` : 'No subjects yet (program defined but not populated)'}`;
+  const label = PROGRAM_NAMES[p] ? `${p} (${PROGRAM_NAMES[p]})` : p;
+  return `• **${label}**: ${count > 0 ? `${count} subjects in database` : 'No subjects yet (program defined but not populated)'}`;
 }).join('\n')}
 
 **🧠 RAG DATABASE ACCESS:**
@@ -349,7 +365,7 @@ When asked "Who should teach [subject]?" or "Who has experience with [subject]?"
 **EXAMPLES OF CORRECT RESPONSES:**
 ✅ "We have **${SYSTEM_PROGRAMS.length} programs** defined in the system: ${SYSTEM_PROGRAMS.join(', ')}"
 ✅ "Currently, **${programsWithData.length} programs** have subjects: ${programsWithData.join(', ')}"
-✅ "**BSIT** has ${subjectsByProgram['BSIT'] || 0} subjects across all year levels"
+✅ "**${SYSTEM_PROGRAMS[0] || 'BSIT'}** has ${subjectsByProgram[SYSTEM_PROGRAMS[0]] || 0} subjects across all year levels"
 ✅ "We have **${stats.totalFaculty} faculty members** in the database"
 ✅ "**${SYSTEM_PROGRAMS.filter(p => !programsWithData.includes(p)).join(', ')}** are defined but don't have subjects yet"` : 
 `**⚠️ DATABASE STATUS:**
@@ -369,10 +385,14 @@ Once data is loaded, I'll have access to:
 
 **🏆 FACULTY RECOMMENDATION RULES:**
 When recommending faculty for a subject, follow this priority order:
-1. ⭐ **TEACHING HISTORY** (HIGHEST PRIORITY): Faculty who have taught this exact subject before
-   - Check the "FACULTY TEACHING HISTORY DATABASE" section
-   - Count how many semesters they taught it
-   - Reference their ratings for that subject
+1. ⭐ **SUBJECT EXPERIENCE, WEIGHTED BY RECENCY** (HIGHEST PRIORITY)
+   - Check the "FACULTY TEACHING HISTORY DATABASE" section for that exact subject
+   - Rank by the **recency-weighted score**, NOT by the raw number of times taught
+   - **Recent experience beats old experience.** Someone who taught it last year is a
+     stronger candidate than someone who last taught it 5 years ago, even if the older
+     teacher taught it more times in total
+   - Treat entries marked ⚠️ DATED (5+ yrs) as weak evidence and say so
+   - Reference their rating for that specific subject
 2. 🎯 **SPECIALIZATION MATCH**: Faculty whose specializations align with the subject area
 3. 📊 **AVAILABLE WORKLOAD**: Faculty who haven't reached their maximum teaching load
 4. 📈 **OVERALL RATING**: Faculty with high average teaching ratings
@@ -381,10 +401,12 @@ When recommending faculty for a subject, follow this priority order:
 
 **RECOMMENDATION FORMAT:**
 When recommending a faculty member, always mention:
-- Their teaching history with the subject: "Prof. X has taught [Subject] 3 times previously (1st Sem 2023, 2nd Sem 2023, 1st Sem 2024)"
+- How many times AND how recently they taught it: "**Prof. X** has taught [Subject] **3 times**, most recently **last year** (2025-2026)"
+- Explicitly flag dated experience: "**Prof. Y** taught it 4 times but not since **2021-2022** (5 years ago), so the experience is dated"
 - Their rating for that subject: "Average rating: 4.5/5.0"
 - Their current workload: "Current load: 15/24 units (9 units available)"
 - Their employment type: "Regular instructor" or "Part-time instructor"
+- Rank candidates in order and briefly justify why the top pick wins on recency
 
 **📋 SYSTEM FEATURES:**
 - AI Schedule Generation (Greedy Algorithm vs OR-Tools)
@@ -504,19 +526,15 @@ const generateChatResponseStream = async (userMessage, context = {}, conversatio
       const errorMessage = error.message || 'Unknown error';
       console.error(`✗ API key ${currentAttemptIndex + 1} failed:`, errorMessage);
 
-      if (
-        errorMessage.includes('429') ||
-        errorMessage.includes('quota') ||
-        errorMessage.includes('RATE_LIMIT') ||
-        errorMessage.includes('API_KEY_INVALID') ||
-        errorMessage.includes('404')
-      ) {
-        markKeyAsFailed(currentAttemptIndex);
-      }
-
-      if (errorMessage.includes('INVALID_ARGUMENT') || errorMessage.includes('PERMISSION_DENIED')) {
+      // A bad request won't be fixed by swapping keys, so stop early.
+      if (errorMessage.includes('INVALID_ARGUMENT')) {
         break;
       }
+
+      // Every other failure is treated as key-specific (rate limits, revoked or
+      // leaked keys returning 403, unavailable models, quota). Put the key in
+      // cooldown so the next attempt actually uses a DIFFERENT key.
+      markKeyAsFailed(currentAttemptIndex);
     }
   }
 
@@ -605,21 +623,15 @@ const generateChatResponse = async (userMessage, context = {}, conversationHisto
       const errorMessage = error.message || 'Unknown error';
       console.error(`✗ API key ${currentAttemptIndex + 1} failed:`, errorMessage);
 
-      // Mark key as failed if it's a rate limit, auth error, or 404
-      if (
-        errorMessage.includes('429') ||
-        errorMessage.includes('quota') ||
-        errorMessage.includes('RATE_LIMIT') ||
-        errorMessage.includes('API_KEY_INVALID') ||
-        errorMessage.includes('404')
-      ) {
-        markKeyAsFailed(currentAttemptIndex);
-      }
-
-      // If not a retryable error, break immediately
-      if (errorMessage.includes('INVALID_ARGUMENT') || errorMessage.includes('PERMISSION_DENIED')) {
+      // A bad request won't be fixed by swapping keys, so stop early.
+      if (errorMessage.includes('INVALID_ARGUMENT')) {
         break;
       }
+
+      // Every other failure is treated as key-specific (rate limits, revoked or
+      // leaked keys returning 403, unavailable models, quota). Put the key in
+      // cooldown so the next attempt actually uses a DIFFERENT key.
+      markKeyAsFailed(currentAttemptIndex);
     }
   }
 

@@ -1,93 +1,64 @@
 const express = require('express');
 const router = express.Router();
 const { body } = require('express-validator');
-const multer = require('multer');
-const path = require('path');
 const {
   getAllClassSpaces,
+  getMyClassSpaces,
   getClassSpaceById,
   createClassSpace,
   updateClassSpace,
   deleteClassSpace,
+  joinByCode,
+  leaveClassSpace,
+  regenerateClassCode,
   postAnnouncement,
   updateAnnouncement,
   deleteAnnouncement,
   uploadMaterial,
   deleteMaterial,
-  enrollStudent,
-  unenrollStudent,
-  getClassSpaceByCode,
-  getMyClassSpaces,
-  enrollByCode
 } = require('../controllers/classSpace.controller');
 const { protect, authorize } = require('../middleware/auth.middleware');
+const { uploadMaterial: uploadMaterialFile } = require('../middleware/upload.middleware');
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, process.env.UPLOAD_PATH || './uploads');
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
-  }
-});
-
-const upload = multer({
-  storage,
-  limits: {
-    fileSize: parseInt(process.env.MAX_FILE_SIZE) || 10485760 // 10MB default
-  },
-  fileFilter: (req, file, cb) => {
-    // Allow common document types
-    const allowedTypes = /pdf|doc|docx|ppt|pptx|xls|xlsx|txt|zip|rar/;
-    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-    const mimetype = allowedTypes.test(file.mimetype);
-    
-    if (mimetype && extname) {
-      return cb(null, true);
-    }
-    cb(new Error('Invalid file type. Only documents are allowed.'));
-  }
-});
-
-// All routes require authentication
+// Everything here requires a logged-in user
 router.use(protect);
 
-// Student section enrollment by code (must be before /:id routes)
-router.post('/enroll-by-code', authorize('student'), enrollByCode);
+const STAFF = ['admin', 'scheduling_officer', 'program_manager'];
+const TEACHING = [...STAFF, 'faculty'];
 
-// Public class space routes (authenticated users)
-router.get('/', getAllClassSpaces);
+/* -------- student enrollment (declared before /:id so it isn't shadowed) -------- */
+router.post('/join', authorize('student'), joinByCode);
+router.post('/:id/leave', authorize('student'), leaveClassSpace);
+
+/* -------- listing -------- */
+// Own classes: any role, resolved per-role in the controller
 router.get('/my-classes', getMyClassSpaces);
-router.get('/code/:enrollmentCode', getClassSpaceByCode);
+// Full listing is staff/faculty only; students must use /my-classes
+router.get('/', authorize(...TEACHING), getAllClassSpaces);
+// Per-class read is membership-checked inside the controller
 router.get('/:id', getClassSpaceById);
 
-// Student enrollment
-router.post('/:id/enroll', enrollStudent);
-router.post('/:id/unenroll', unenrollStudent);
-
-// Admin/Program Manager routes
-router.post('/', authorize('admin', 'scheduling_officer', 'program_manager'), createClassSpace);
-router.put('/:id', authorize('admin', 'scheduling_officer', 'program_manager', 'faculty'), updateClassSpace);
+/* -------- class space management -------- */
+router.post('/', authorize(...STAFF), createClassSpace);
+router.put('/:id', authorize(...TEACHING), updateClassSpace);
 router.delete('/:id', authorize('admin'), deleteClassSpace);
+router.put('/:id/regenerate-code', authorize(...TEACHING), regenerateClassCode);
 
-// Announcement routes (Faculty and Program Managers can post to their classes)
-router.post('/:id/announcements', authorize('admin', 'scheduling_officer', 'program_manager', 'faculty'), 
+/* -------- announcements -------- */
+router.post(
+  '/:id/announcements',
+  authorize(...TEACHING),
   [
     body('title').trim().notEmpty().withMessage('Title is required'),
-    body('content').trim().notEmpty().withMessage('Content is required')
+    body('content').trim().notEmpty().withMessage('Content is required'),
   ],
   postAnnouncement
 );
-router.put('/:id/announcements/:announcementId', authorize('admin', 'scheduling_officer', 'program_manager', 'faculty'), updateAnnouncement);
-router.delete('/:id/announcements/:announcementId', authorize('admin', 'scheduling_officer', 'program_manager', 'faculty'), deleteAnnouncement);
+router.put('/:id/announcements/:announcementId', authorize(...TEACHING), updateAnnouncement);
+router.delete('/:id/announcements/:announcementId', authorize(...TEACHING), deleteAnnouncement);
 
-// Material routes (Faculty and Program Managers can upload to their classes)
-router.post('/:id/materials', authorize('admin', 'scheduling_officer', 'program_manager', 'faculty'),
-  upload.single('file'),
-  uploadMaterial
-);
-router.delete('/:id/materials/:materialId', authorize('admin', 'scheduling_officer', 'program_manager', 'faculty'), deleteMaterial);
+/* -------- materials -------- */
+router.post('/:id/materials', authorize(...TEACHING), uploadMaterialFile.single('file'), uploadMaterial);
+router.delete('/:id/materials/:materialId', authorize(...TEACHING), deleteMaterial);
 
 module.exports = router;

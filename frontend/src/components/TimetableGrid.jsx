@@ -1,7 +1,7 @@
-import React from 'react';
-import { Clock, Utensils } from 'lucide-react';
+import React, { useMemo, useState } from 'react';
+import { Clock, Utensils, MapPin, User } from 'lucide-react';
 
-const DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+const WEEK_DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
 
 // All time slots in 24-hour format
 const ALL_TIME_SLOTS = [
@@ -10,238 +10,319 @@ const ALL_TIME_SLOTS = [
   '19:00', '20:00', '21:00'
 ];
 
-// Convert 24-hour time to 12-hour format with AM/PM
+/**
+ * Fixed height of one hour row, in pixels.
+ *
+ * Pinned on the time-label cell of every row so a cell with rowSpan={n} is
+ * always exactly n rows tall. Without this, rows sized themselves to their
+ * tallest card while rows covered by a rowSpan collapsed, so multi-hour blocks
+ * never lined up with their hour labels.
+ */
+const ROW_H = 74;
+
+const toMinutes = (time) => {
+  if (!time) return null;
+  const [h, m] = String(time).split(':').map(Number);
+  if (Number.isNaN(h)) return null;
+  return h * 60 + (m || 0);
+};
+
 const formatTime12Hour = (time24) => {
-  const [hours, minutes] = time24.split(':').map(Number);
+  const mins = toMinutes(time24);
+  if (mins === null) return time24 || '';
+  const hours = Math.floor(mins / 60);
+  const minutes = mins % 60;
   const period = hours >= 12 ? 'PM' : 'AM';
-  const hours12 = hours === 0 ? 12 : hours > 12 ? hours - 12 : hours;
-  return `${hours12}:${minutes.toString().padStart(2, '0')} ${period}`;
+  const hours12 = hours % 12 === 0 ? 12 : hours % 12;
+  return `${hours12}:${String(minutes).padStart(2, '0')} ${period}`;
 };
 
-// Get time range label (e.g., "7:00 AM - 8:00 AM")
-const getTimeRangeLabel = (startTime) => {
-  const [hours] = startTime.split(':').map(Number);
-  const endHour = hours + 1;
-  const endTime = `${endHour.toString().padStart(2, '0')}:00`;
-  return `${formatTime12Hour(startTime)} - ${formatTime12Hour(endTime)}`;
+/** Short label for the time gutter, e.g. "8 AM". */
+const shortHourLabel = (time24) => {
+  const mins = toMinutes(time24);
+  if (mins === null) return time24 || '';
+  const hours = Math.floor(mins / 60);
+  const period = hours >= 12 ? 'PM' : 'AM';
+  const hours12 = hours % 12 === 0 ? 12 : hours % 12;
+  return `${hours12} ${period}`;
 };
 
-// Check if time slot is lunch break (12:00 PM - 1:00 PM)
-const isLunchBreak = (time) => {
-  return time === '12:00';
+const isLunchBreak = (time) => time === '12:00';
+
+const durationHours = (slot) => {
+  const start = toMinutes(slot?.startTime);
+  const end = toMinutes(slot?.endTime);
+  if (start === null || end === null || end <= start) return 1;
+  return Math.max(1, Math.ceil((end - start) / 60));
 };
 
-const TimetableGrid = ({ schedules, onScheduleClick, canEdit, viewMode = 'week', shift = 'all' }) => {
-  // Filter time slots based on shift
-  const getFilteredTimeSlots = () => {
+const facultyName = (schedule) => {
+  const u = schedule?.faculty?.user;
+  const name = u ? `${u.firstName || ''} ${u.lastName || ''}`.trim() : '';
+  return name || null;
+};
+
+const TimetableGrid = ({
+  schedules = [],
+  onScheduleClick,
+  canEdit,
+  viewMode = 'week',
+  shift = 'all',
+  // When several sections share the grid, label each card so it's clear which
+  // section a class belongs to.
+  showSection = false,
+}) => {
+  const [selectedDay, setSelectedDay] = useState('Monday');
+
+  const TIME_SLOTS = useMemo(() => {
     if (shift === 'Day') {
-      // Day shift: 7 AM - 4 PM (07:00 - 16:00)
-      return ALL_TIME_SLOTS.filter(time => {
-        const hour = parseInt(time.split(':')[0]);
-        return hour >= 7 && hour < 16;
-      });
-    } else if (shift === 'Night') {
-      // Night shift: 4 PM - 10 PM (16:00 - 22:00)
-      return ALL_TIME_SLOTS.filter(time => {
-        const hour = parseInt(time.split(':')[0]);
-        return hour >= 16 && hour <= 21;
+      return ALL_TIME_SLOTS.filter(t => {
+        const h = Math.floor(toMinutes(t) / 60);
+        return h >= 7 && h < 16;
       });
     }
-    // All shifts
+    if (shift === 'Night') {
+      return ALL_TIME_SLOTS.filter(t => {
+        const h = Math.floor(toMinutes(t) / 60);
+        return h >= 16 && h <= 21;
+      });
+    }
     return ALL_TIME_SLOTS;
-  };
+  }, [shift]);
 
-  const TIME_SLOTS = getFilteredTimeSlots();
+  // Only show Sunday when something is actually scheduled on it
+  const days = useMemo(() => {
+    const used = new Set();
+    schedules.forEach(s => (s.timeSlots || []).forEach(sl => used.add(sl.day)));
+    return WEEK_DAYS.filter(d => d !== 'Sunday' || used.has('Sunday'));
+  }, [schedules]);
 
-  // Group schedules by day and time
-  const getSchedulesForSlot = (day, timeSlot) => {
-    return schedules.filter(schedule => {
-      if (!schedule.timeSlots || schedule.timeSlots.length === 0) return false;
-      
-      return schedule.timeSlots.some(slot => {
-        if (slot.day !== day) return false;
-        
-        // Check if this time slot falls within the schedule's time range
-        const slotTime = timeSlot + ':00';
-        const startTime = slot.startTime;
-        const endTime = slot.endTime;
-        
-        // Convert times to minutes for comparison
-        const toMinutes = (time) => {
-          const [hours, minutes] = time.split(':').map(Number);
-          return hours * 60 + (minutes || 0);
-        };
-        
-        const slotMinutes = toMinutes(slotTime);
-        const startMinutes = toMinutes(startTime);
-        const endMinutes = toMinutes(endTime);
-        
-        return slotMinutes >= startMinutes && slotMinutes < endMinutes;
+  /**
+   * Occupancy map: `${day}-${HH:MM}` -> [{ schedule, slot, isStart }]
+   * covering every hour a class spans.
+   *
+   * This replaces a `shouldHideCell` helper whose guard compared
+   * `prevTimeSlot + ':00'` (e.g. "08:00:00") against `slot.startTime` ("08:00").
+   * That could never match, so no cell was ever hidden and a 4-hour class was
+   * re-rendered once per hour it covered.
+   */
+  const occupancy = useMemo(() => {
+    const map = new Map();
+
+    schedules.forEach(schedule => {
+      (schedule.timeSlots || []).forEach(slot => {
+        const start = toMinutes(slot.startTime);
+        const end = toMinutes(slot.endTime);
+        if (start === null || end === null) return;
+
+        const firstHour = Math.floor(start / 60);
+        for (let h = firstHour; h < Math.ceil(end / 60); h++) {
+          const key = `${slot.day}-${String(h).padStart(2, '0')}:00`;
+          const entry = { schedule, slot, isStart: h === firstHour };
+          const list = map.get(key);
+          if (list) list.push(entry);
+          else map.set(key, [entry]);
+        }
       });
     });
+
+    return map;
+  }, [schedules]);
+
+  const entriesAt = (day, time) => occupancy.get(`${day}-${time}`) || [];
+
+  /** Hours actually rendered, so we can tell if a class's start row is visible. */
+  const renderedHours = useMemo(() => new Set(TIME_SLOTS), [TIME_SLOTS]);
+
+  /**
+   * Classes to draw in this cell.
+   *
+   * Normally that's the ones starting here. It also includes a class whose real
+   * start hour falls OUTSIDE the visible range (e.g. a 06:00-09:00 class while
+   * the Day filter begins at 07:00) - otherwise no cell would claim it, the row
+   * would be short one <td>, and every column to the right would shift across.
+   */
+  const startingAt = (day, time) =>
+    entriesAt(day, time).filter(e => {
+      if (e.isStart) return true;
+      const startHour = String(Math.floor(toMinutes(e.slot.startTime) / 60)).padStart(2, '0');
+      return !renderedHours.has(`${startHour}:00`) && time === TIME_SLOTS[0];
+    });
+
+  /** Cell is covered by a class drawn in an earlier visible row. */
+  const isCovered = (day, time) => {
+    const list = entriesAt(day, time);
+    if (list.length === 0) return false;
+    return startingAt(day, time).length === 0;
   };
 
-  // Calculate row span for a schedule
-  const getRowSpan = (schedule, day, startTime) => {
-    const slot = schedule.timeSlots?.find(s => s.day === day);
-    if (!slot) return 1;
-    
-    const toMinutes = (time) => {
-      const [hours, minutes] = time.split(':').map(Number);
-      return hours * 60 + (minutes || 0);
-    };
-    
-    const duration = toMinutes(slot.endTime) - toMinutes(slot.startTime);
-    return Math.ceil(duration / 60); // Convert minutes to hours
-  };
+  const statusClasses = (schedule) =>
+    schedule.status === 'published'
+      ? 'bg-green-50 border-green-500 hover:bg-green-100 dark:bg-green-900/40 dark:border-green-400'
+      : 'bg-orange-50 border-orange-500 hover:bg-orange-100 dark:bg-orange-900/40 dark:border-orange-400';
 
-  // Check if this cell should be hidden (part of a multi-hour block above)
-  const shouldHideCell = (day, timeSlot) => {
-    const timeIndex = TIME_SLOTS.indexOf(timeSlot);
-    if (timeIndex === 0) return false;
-    
-    // Check if any schedule from previous slots extends into this one
-    for (let i = timeIndex - 1; i >= 0; i--) {
-      const prevTimeSlot = TIME_SLOTS[i];
-      const schedulesInPrevSlot = getSchedulesForSlot(day, prevTimeSlot);
-      
-      for (const schedule of schedulesInPrevSlot) {
-        const slot = schedule.timeSlots?.find(s => s.day === day);
-        if (!slot) continue;
-        
-        const toMinutes = (time) => {
-          const [hours, minutes] = time.split(':').map(Number);
-          return hours * 60 + (minutes || 0);
-        };
-        
-        const currentTimeMinutes = toMinutes(timeSlot + ':00');
-        const endMinutes = toMinutes(slot.endTime);
-        
-        if (currentTimeMinutes < endMinutes && prevTimeSlot + ':00' === slot.startTime) {
-          return true;
-        }
-      }
-    }
-    
-    return false;
-  };
+  /** One class block. Stretches to fill its cell. */
+  const ScheduleCard = ({ schedule, slot, compact }) => (
+    <div
+      onClick={() => canEdit && onScheduleClick?.(schedule)}
+      className={`flex-1 min-h-0 overflow-hidden rounded-md border-l-4 px-2 py-1.5 text-xs transition-colors ${
+        canEdit ? 'cursor-pointer' : ''
+      } ${statusClasses(schedule)}`}
+      title={`${schedule.subject?.subjectCode || ''} ${schedule.subject?.subjectName || ''}\n${formatTime12Hour(slot?.startTime)} - ${formatTime12Hour(slot?.endTime)}`}
+    >
+      <div className="flex items-center justify-between gap-1">
+        <span className="font-bold text-gray-900 dark:text-gray-100 truncate">
+          {schedule.subject?.subjectCode || 'N/A'}
+        </span>
+        {showSection && schedule.sectionCode && (
+          <span className="flex-shrink-0 px-1 rounded bg-gray-900/10 dark:bg-white/15 text-[9px] font-semibold text-gray-700 dark:text-gray-200">
+            {schedule.sectionCode}
+          </span>
+        )}
+      </div>
 
-  // Render based on view mode
+      {!compact && (
+        <div className="text-gray-600 dark:text-gray-300 truncate">
+          {schedule.subject?.subjectName}
+        </div>
+      )}
+
+      {!compact && facultyName(schedule) && (
+        <div className="text-gray-500 dark:text-gray-400 truncate flex items-center gap-1">
+          <User className="w-3 h-3 flex-shrink-0" />
+          {facultyName(schedule)}
+        </div>
+      )}
+
+      <div className="text-gray-500 dark:text-gray-400 truncate flex items-center gap-1">
+        <MapPin className="w-3 h-3 flex-shrink-0" />
+        {/* roomLabel is resolved server-side; `room` holds a Room id */}
+        {schedule.roomLabel || 'TBA'}
+      </div>
+
+      <div className="text-gray-500 dark:text-gray-400 font-medium truncate">
+        {formatTime12Hour(slot?.startTime)} – {formatTime12Hour(slot?.endTime)}
+      </div>
+    </div>
+  );
+
+  /* ------------------------------------------------------------------ *
+   * Day view
+   * ------------------------------------------------------------------ */
   if (viewMode === 'day') {
-    // Day view: Show one day at a time (for now, show Monday)
-    const selectedDay = 'Monday';
-    
     return (
-      <div className="overflow-x-auto">
-        <div className="min-w-full">
-          <div className="bg-gray-50 border-b-2 border-gray-300 p-4 text-center dark:bg-gray-800 dark:border-gray-600">
-            <h2 className="text-xl font-bold text-gray-900 dark:text-gray-100">{selectedDay}</h2>
-          </div>
-          
-          <div className="space-y-2 p-4 dark:bg-gray-900">
-            {TIME_SLOTS.map((time) => {
-              // Check if this is lunch break
-              if (isLunchBreak(time)) {
-                return (
-                  <div key={time} className="flex gap-4 min-h-[80px] bg-yellow-50 border-2 border-yellow-300 rounded-lg dark:bg-yellow-900 dark:border-yellow-600">
-                    <div className="w-24 flex-shrink-0 text-sm font-medium text-yellow-800 flex items-center px-2 dark:text-yellow-100">
-                      <Utensils size={14} className="mr-1" />
-                      {getTimeRangeLabel(time)}
-                    </div>
-                    <div className="flex-1 flex items-center justify-center">
-                      <div className="text-center">
-                        <p className="text-lg font-bold text-yellow-800 dark:text-yellow-100">🍽️ LUNCH BREAK</p>
-                        <p className="text-xs text-yellow-700 dark:text-yellow-200">12:00 PM - 1:00 PM</p>
-                      </div>
-                    </div>
-                  </div>
-                );
-              }
+      <div>
+        {/* Day picker. This used to be hard-coded to Monday, so "Day View"
+            always showed Monday no matter what. */}
+        <div className="flex flex-wrap gap-1 mb-4">
+          {days.map(day => {
+            const count = schedules.filter(s =>
+              (s.timeSlots || []).some(sl => sl.day === day)
+            ).length;
+            return (
+              <button
+                key={day}
+                onClick={() => setSelectedDay(day)}
+                className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                  selectedDay === day
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600'
+                }`}
+              >
+                {day.slice(0, 3)}
+                {count > 0 && (
+                  <span className={`ml-1.5 text-[10px] ${selectedDay === day ? 'opacity-80' : 'text-gray-500 dark:text-gray-400'}`}>
+                    {count}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
 
-              const schedules = getSchedulesForSlot(selectedDay, time);
-              
+        <div className="space-y-1.5">
+          {TIME_SLOTS.map(time => {
+            if (isLunchBreak(time)) {
               return (
-                <div key={time} className="flex gap-4 min-h-[80px]">
-                  <div className="w-24 flex-shrink-0 text-sm font-medium text-gray-600 flex items-center dark:text-gray-300">
-                    <Clock size={14} className="mr-1" />
-                    {getTimeRangeLabel(time)}
-                  </div>
-                  <div className="flex-1 grid grid-cols-1 gap-2">
-                    {schedules.map((schedule, idx) => (
-                      <div
-                        key={`${schedule._id}-${idx}`}
-                        onClick={() => canEdit && onScheduleClick(schedule)}
-                        className={`p-3 rounded-lg border-2 cursor-pointer transition-all ${
-                          schedule.status === 'published'
-                            ? 'bg-green-50 border-green-500 hover:bg-green-100 dark:bg-green-900 dark:border-green-400 dark:hover:bg-green-800'
-                            : 'bg-orange-50 border-orange-500 hover:bg-orange-100 dark:bg-orange-900 dark:border-orange-400 dark:hover:bg-orange-800'
-                        }`}
-                      >
-                        <div className="font-bold text-sm dark:text-gray-100">{schedule.subject?.subjectCode || 'N/A'}</div>
-                        <div className="text-xs text-gray-600 mt-1 dark:text-gray-300">{schedule.subject?.subjectName}</div>
-                        <div className="text-xs text-gray-500 mt-1 dark:text-gray-400">
-                          👨‍🏫 {schedule.faculty?.user?.firstName} {schedule.faculty?.user?.lastName}
-                        </div>
-                        <div className="text-xs text-gray-500 dark:text-gray-400">
-                          🏫 {schedule.room || 'TBA'}
-                        </div>
-                        <div className="text-xs text-gray-500 dark:text-gray-400">
-                          {formatTime12Hour(schedule.timeSlots?.[0]?.startTime || '00:00')} - {formatTime12Hour(schedule.timeSlots?.[0]?.endTime || '00:00')}
-                        </div>
-                      </div>
-                    ))}
-                    {schedules.length === 0 && (
-                      <div className="text-gray-400 text-sm italic p-3 dark:text-gray-500">No classes scheduled</div>
-                    )}
-                  </div>
+                <div key={time} className="flex items-center gap-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg px-3 py-2">
+                  <span className="w-16 flex-shrink-0 text-xs font-medium text-amber-800 dark:text-amber-200">
+                    {shortHourLabel(time)}
+                  </span>
+                  <span className="text-sm font-semibold text-amber-800 dark:text-amber-200 flex items-center gap-2">
+                    <Utensils size={14} />
+                    Lunch Break
+                  </span>
                 </div>
               );
-            })}
-          </div>
+            }
+
+            const starting = startingAt(selectedDay, time);
+            const covered = isCovered(selectedDay, time);
+
+            return (
+              <div key={time} className="flex items-stretch gap-3">
+                <span className="w-16 flex-shrink-0 pt-1 text-xs font-medium text-gray-500 dark:text-gray-400">
+                  {shortHourLabel(time)}
+                </span>
+                <div className="flex-1 flex flex-col gap-1.5" style={{ minHeight: 44 }}>
+                  {starting.map(({ schedule, slot }) => (
+                    <div key={`${schedule._id}-${slot.startTime}`} className="flex" style={{ minHeight: 44 }}>
+                      <ScheduleCard schedule={schedule} slot={slot} />
+                    </div>
+                  ))}
+                  {starting.length === 0 && (
+                    <div className="flex items-center text-xs text-gray-300 dark:text-gray-600 italic">
+                      {covered ? '' : 'Free'}
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
     );
   }
 
-  // Week view: Standard timetable grid
+  /* ------------------------------------------------------------------ *
+   * Week view
+   * ------------------------------------------------------------------ */
   return (
     <div className="overflow-x-auto">
-      <table className="min-w-full border-collapse">
+      <table className="w-full border-collapse" style={{ minWidth: `${140 + days.length * 130}px` }}>
         <thead>
           <tr>
-            <th className="border border-gray-300 bg-gray-100 p-3 w-24 sticky left-0 z-10 dark:bg-gray-800 dark:border-gray-600">
-              <Clock size={16} className="mx-auto dark:text-gray-300" />
+            <th
+              className="bg-gray-50 dark:bg-gray-800 border-b border-r border-gray-200 dark:border-gray-600 px-2 py-2.5"
+              style={{ width: 72 }}
+            >
+              <Clock size={14} className="mx-auto text-gray-400" />
             </th>
-            {DAYS.map(day => (
+            {days.map(day => (
               <th
                 key={day}
-                className="border border-gray-300 bg-gray-100 p-3 text-sm font-semibold text-gray-700 dark:bg-gray-800 dark:border-gray-600 dark:text-gray-200"
+                className="bg-gray-50 dark:bg-gray-800 border-b border-r border-gray-200 dark:border-gray-600 last:border-r-0 px-2 py-2.5 text-xs font-bold uppercase tracking-wide text-gray-700 dark:text-gray-200"
               >
-                {day}
+                {day.slice(0, 3)}
               </th>
             ))}
           </tr>
         </thead>
         <tbody>
-          {TIME_SLOTS.map((time, timeIndex) => {
-            // Check if this is lunch break (12:00 PM - 1:00 PM)
+          {TIME_SLOTS.map(time => {
             if (isLunchBreak(time)) {
               return (
-                <tr key={time} className="bg-yellow-50 dark:bg-yellow-900">
-                  <td className="border border-gray-300 bg-yellow-100 p-2 text-sm font-medium text-yellow-800 text-center sticky left-0 z-10 dark:bg-yellow-800 dark:border-gray-600 dark:text-yellow-100">
-                    <div className="flex flex-col items-center">
-                      <Utensils size={16} className="mb-1" />
-                      <span className="text-xs">{getTimeRangeLabel(time)}</span>
-                    </div>
-                  </td>
-                  <td colSpan={7} className="border border-yellow-300 p-4 text-center dark:border-yellow-600">
-                    <div className="flex items-center justify-center gap-2">
-                      <span className="text-2xl">🍽️</span>
-                      <div>
-                        <p className="text-lg font-bold text-yellow-800 dark:text-yellow-100">LUNCH BREAK</p>
-                        <p className="text-xs text-yellow-700 dark:text-yellow-200">12:00 PM - 1:00 PM</p>
-                      </div>
-                    </div>
+                <tr key={time}>
+                  {/* colSpan matches the rendered column count; it was hard-coded
+                      to 7 while the table can have a different number of days. */}
+                  <td
+                    colSpan={days.length + 1}
+                    className="border-b border-gray-200 dark:border-gray-600 bg-amber-50 dark:bg-amber-900/20 px-3 py-1.5 text-center text-xs font-semibold text-amber-700 dark:text-amber-300"
+                  >
+                    <span className="inline-flex items-center gap-2">
+                      <Utensils size={13} />
+                      Lunch Break — 12:00 PM – 1:00 PM
+                    </span>
                   </td>
                 </tr>
               );
@@ -249,53 +330,48 @@ const TimetableGrid = ({ schedules, onScheduleClick, canEdit, viewMode = 'week',
 
             return (
               <tr key={time}>
-                <td className="border border-gray-300 bg-gray-50 p-2 text-xs font-medium text-gray-600 text-center sticky left-0 z-10 dark:bg-gray-800 dark:border-gray-600 dark:text-gray-300">
-                  {getTimeRangeLabel(time)}
+                {/* The fixed height here is what keeps every column aligned */}
+                <td
+                  className="border-b border-r border-gray-100 dark:border-gray-700 px-2 align-top"
+                  style={{ height: ROW_H, width: 72 }}
+                >
+                  <span className="text-xs font-medium text-gray-500 dark:text-gray-400 whitespace-nowrap">
+                    {shortHourLabel(time)}
+                  </span>
                 </td>
-                {DAYS.map(day => {
-                  if (shouldHideCell(day, time)) {
-                    return null; // Cell is hidden (part of multi-hour block above)
-                  }
-                  
-                  const schedulesInSlot = getSchedulesForSlot(day, time);
-                  const firstSchedule = schedulesInSlot[0];
-                  const rowSpan = firstSchedule ? getRowSpan(firstSchedule, day, time) : 1;
-                  
+
+                {days.map(day => {
+                  if (isCovered(day, time)) return null; // spanned from above
+
+                  const starting = startingAt(day, time);
+                  // Span the longest class starting here, clamped to the rows left
+                  const rowsLeft = TIME_SLOTS.length - TIME_SLOTS.indexOf(time);
+                  const span = Math.min(
+                    Math.max(1, ...starting.map(e => durationHours(e.slot))),
+                    rowsLeft
+                  );
+
                   return (
                     <td
                       key={day}
-                      rowSpan={rowSpan}
-                      className="border border-gray-300 p-2 align-top min-h-[80px] bg-white hover:bg-gray-50 dark:bg-gray-900 dark:border-gray-600 dark:hover:bg-gray-800"
+                      rowSpan={span}
+                      className="border-b border-r border-gray-100 dark:border-gray-700 last:border-r-0 p-1 align-top"
+                      style={{ height: span * ROW_H, minWidth: 130 }}
                     >
-                      {schedulesInSlot.length > 0 ? (
-                        <div className="space-y-2">
-                          {schedulesInSlot.map((schedule, idx) => (
-                            <div
-                              key={`${schedule._id}-${idx}`}
-                              onClick={() => canEdit && onScheduleClick(schedule)}
-                              className={`p-2 rounded-md border-l-4 cursor-pointer transition-all text-xs ${
-                                schedule.status === 'published'
-                                  ? 'bg-green-50 border-green-500 hover:bg-green-100 dark:bg-green-900 dark:border-green-400 dark:hover:bg-green-800'
-                                  : 'bg-orange-50 border-orange-500 hover:bg-orange-100 dark:bg-orange-900 dark:border-orange-400 dark:hover:bg-orange-800'
-                              }`}
-                            >
-                              <div className="font-bold dark:text-gray-100">{schedule.subject?.subjectCode || 'N/A'}</div>
-                              <div className="text-gray-600 truncate dark:text-gray-300">{schedule.subject?.subjectName}</div>
-                              <div className="text-gray-500 mt-1 dark:text-gray-400">
-                                👨‍🏫 {schedule.faculty?.user?.firstName} {schedule.faculty?.user?.lastName}
-                              </div>
-                              <div className="text-gray-500 dark:text-gray-400">
-                                🏫 {schedule.room || 'TBA'}
-                              </div>
-                              <div className="text-gray-500 font-medium mt-1 dark:text-gray-400">
-                                {formatTime12Hour(schedule.timeSlots?.find(s => s.day === day)?.startTime || '00:00')} - 
-                                {formatTime12Hour(schedule.timeSlots?.find(s => s.day === day)?.endTime || '00:00')}
-                              </div>
-                            </div>
+                      {starting.length > 0 ? (
+                        <div className="flex flex-col gap-1 h-full">
+                          {starting.map(({ schedule, slot }) => (
+                            <ScheduleCard
+                              key={`${schedule._id}-${slot.startTime}`}
+                              schedule={schedule}
+                              slot={slot}
+                              // Two classes sharing a slot get a condensed card
+                              compact={starting.length > 1 || span === 1}
+                            />
                           ))}
                         </div>
                       ) : (
-                        <div className="text-gray-300 text-xs text-center py-4 dark:text-gray-600">-</div>
+                        <div className="h-full" />
                       )}
                     </td>
                   );

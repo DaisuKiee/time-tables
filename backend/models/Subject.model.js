@@ -1,5 +1,7 @@
 const mongoose = require('mongoose');
 
+const { programFieldValidator } = require('../utils/programValidator');
+
 const SubjectSchema = new mongoose.Schema({
   subjectCode: {
     type: String,
@@ -36,7 +38,9 @@ const SubjectSchema = new mongoose.Schema({
   program: {
     type: String,
     required: [true, 'Program is required'],
-    enum: ['BSIT', 'BSHM', 'BIT-ET', 'BIT-CT', 'BIT-AT', 'BSFI', 'BSIE', 'General'],
+    trim: true,
+    // 'General' covers subjects shared across every program (e.g. GE courses)
+    validate: programFieldValidator({ extraAllowed: ['General'] }),
   },
   yearLevel: {
     type: Number,

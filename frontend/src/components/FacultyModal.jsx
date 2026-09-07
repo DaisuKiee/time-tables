@@ -1,28 +1,32 @@
 import React, { useState, useEffect } from 'react';
-import { facultyAPI, userAPI } from '../services/api';
+import { facultyAPI, userAPI, programAPI } from '../services/api';
 import toast from 'react-hot-toast';
 import { X, Plus, Trash2, User, Users, Mail, Award, BookOpen, Save, UserCheck, Clock } from 'lucide-react';
 
 const FacultyModal = ({ mode, faculty, onClose }) => {
   const [loading, setLoading] = useState(false);
   const [users, setUsers] = useState([]);
+  const [programs, setPrograms] = useState([]);
   const [formData, setFormData] = useState({
     user: '',
     employeeId: '',
     employmentType: 'Regular',
     specialization: [''],
+    programs: [],
     maxLoad: 40,
     isActive: true
   });
 
   useEffect(() => {
     loadUsers();
+    loadPrograms();
     if (mode === 'edit' && faculty) {
       setFormData({
         user: faculty.user?._id || '',
         employeeId: faculty.employeeId || '',
         employmentType: faculty.employmentType || 'Regular',
         specialization: faculty.specialization || [''],
+        programs: faculty.programs || [],
         maxLoad: faculty.maxLoad || 40,
         isActive: faculty.isActive !== false
       });
@@ -44,6 +48,16 @@ const FacultyModal = ({ mode, faculty, onClose }) => {
       setUsers(response.data.data || []);
     } catch (error) {
       console.error('Load users error:', error);
+    }
+  };
+
+  const loadPrograms = async () => {
+    try {
+      const response = await programAPI.getAll({ isActive: true });
+      setPrograms(response.data.data || []);
+    } catch (error) {
+      console.error('Load programs error:', error);
+      toast.error('Failed to load programs');
     }
   };
 
@@ -314,6 +328,37 @@ const FacultyModal = ({ mode, faculty, onClose }) => {
                       </div>
                     </div>
                   )}
+                </div>
+
+                {/* Programs - Multi-select */}
+                <div className="mt-4">
+                  <label className="block text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">
+                    Qualified Programs <span className="text-red-500">*</span>
+                  </label>
+                  <div className="space-y-2">
+                    {programs.map((prog) => (
+                      <label key={prog._id} className="flex items-center p-3 bg-white dark:bg-gray-800 rounded-lg border-2 border-gray-300 dark:border-gray-600 hover:border-teal-500 dark:hover:border-teal-500 cursor-pointer transition-all">
+                        <input
+                          type="checkbox"
+                          checked={formData.programs?.includes(prog.code) || false}
+                          onChange={(e) => {
+                            const currentPrograms = formData.programs || [];
+                            const newPrograms = e.target.checked
+                              ? [...currentPrograms, prog.code]
+                              : currentPrograms.filter(p => p !== prog.code);
+                            setFormData({ ...formData, programs: newPrograms });
+                          }}
+                          className="h-4 w-4 text-teal-600 focus:ring-teal-500 border-gray-300 rounded"
+                        />
+                        <span className="ml-3 text-sm font-medium text-gray-900 dark:text-white">
+                          {prog.code} - {prog.name}
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-2">
+                    Select all programs this faculty member is qualified to teach
+                  </p>
                 </div>
               </div>
 

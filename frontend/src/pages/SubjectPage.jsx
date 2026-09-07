@@ -10,14 +10,15 @@ import {
 import SubjectModal from '../components/SubjectModal';
 import ExcelImportModal from '../components/ExcelImportModal';
 import { useAuth } from '../context/AuthContext';
+import { usePrograms } from '../hooks/usePrograms';
 
-const PROGRAMS = ['BSIT', 'BSHM', 'BIT-ET', 'BIT-CT', 'BIT-AT', 'BSFI', 'BSIE'];
 const YEAR_LEVELS = [1, 2, 3, 4];
 const SEMESTERS = [1, 2];
 const SUBJECT_TYPES = ['Lecture', 'Laboratory', 'Both'];
 
 const SubjectPage = () => {
   const { user } = useAuth();
+  const { programCodes: PROGRAMS } = usePrograms();
   const [subjects, setSubjects] = useState([]);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
@@ -49,9 +50,10 @@ const SubjectPage = () => {
     loadSubjects();
   }, []);
 
+  // PROGRAMS arrives asynchronously, so recompute once it loads
   useEffect(() => {
     calculateStats();
-  }, [subjects]);
+  }, [subjects, PROGRAMS]);
 
   // // Disable body scroll when modal is open
   // useEffect(() => {
@@ -243,7 +245,7 @@ const SubjectPage = () => {
               <span className="text-xs font-medium opacity-80">AVERAGE</span>
             </div>
             <div className="text-2xl md:text-3xl font-bold">
-              {stats.total > 0 ? Math.round(stats.total / PROGRAMS.length) : 0}
+              {stats.total > 0 && PROGRAMS.length > 0 ? Math.round(stats.total / PROGRAMS.length) : 0}
             </div>
             <div className="text-xs opacity-80 mt-1">Per Program</div>
           </div>

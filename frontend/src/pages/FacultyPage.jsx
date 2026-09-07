@@ -6,16 +6,44 @@ import {
   Plus, Search, Edit2, Trash2, Eye, X,
   User, Mail, Phone, BookOpen, Award, FileText,
   Users, UserCheck, TrendingUp, AlertCircle,
-  Grid3x3, List
+  Grid3x3, List, GraduationCap, Briefcase, Star, Layers, Clock
 } from 'lucide-react';
 import FacultyModal from '../components/FacultyModal';
 import FacultyDetailsModal from '../components/FacultyDetailsModal';
 import ExcelImportModal from '../components/ExcelImportModal';
+import { useAuth } from '../context/AuthContext';
+import { usePrograms } from '../hooks/usePrograms';
+import { summarizeAllSubjects, describeRecency } from '../utils/teachingExperience';
+
+// Accessors for the Faculty schema (backend/models/Faculty.model.js).
+// The fields are `maxTeachingLoad` and `specializations` — reading `maxLoad` or
+// `specialization` yields undefined, which renders as "0 / hrs" and NaN-width bars.
+const getMaxLoad = (f) => f.maxTeachingLoad || 24;
+const getSpecializations = (f) => f.specializations || [];
+const getPrograms = (f) => f.programs || [];
+const getTopQualification = (f) => {
+  const q = (f.qualifications || [])[0];
+  if (!q) return null;
+  return [q.degree, q.field].filter(Boolean).join(' in ');
+};
+const getLoadPercent = (f) =>
+  Math.min((((f.currentLoad || 0) / getMaxLoad(f)) * 100), 100);
+
+// The schema has no `averageRating` field — ratings live on individual
+// teachingHistory entries, so average the ones that have a score.
+const getAverageRating = (f) => {
+  const rated = (f.teachingHistory || []).filter(h => typeof h.rating === 'number' && h.rating > 0);
+  if (rated.length === 0) return null;
+  return rated.reduce((sum, h) => sum + h.rating, 0) / rated.length;
+};
 
 const FacultyPage = () => {
+  const { user } = useAuth();
+  const { programCodes } = usePrograms();
   const [faculty, setFaculty] = useState([]);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
+  const [filterProgram, setFilterProgram] = useState('');
   const [filterSpecialization, setFilterSpecialization] = useState('');
   const [viewMode, setViewMode] = useState('grid'); // 'grid' or 'list'
   const [showModal, setShowModal] = useState(false);
@@ -24,15 +52,26 @@ const FacultyPage = () => {
   const [selectedFaculty, setSelectedFaculty] = useState(null);
   const [modalMode, setModalMode] = useState('create'); // 'create' or 'edit'
 
+  // Program managers are locked to their own program
+  useEffect(() => {
+    if (user?.role === 'program_manager' && user?.program) {
+      setFilterProgram(user.program);
+    }
+  }, [user]);
+
+  // Program filtering happens server-side, so refetch whenever it changes
   useEffect(() => {
     loadFaculty();
-  }, []);
+  }, [filterProgram]);
 
   const loadFaculty = async () => {
     try {
       setLoading(true);
       // Only load active faculty (excluding soft-deleted ones)
-      const response = await facultyAPI.getAll({ isActive: true });
+      const params = { isActive: true };
+      if (filterProgram) params.program = filterProgram;
+
+      const response = await facultyAPI.getAll(params);
       setFaculty(response.data.data || []);
     } catch (error) {
       console.error('Load faculty error:', error);
@@ -102,15 +141,17 @@ const FacultyPage = () => {
     
     const matchesSpecialization = 
       !filterSpecialization || 
-      f.specialization?.some(s => s.toLowerCase().includes(filterSpecialization.toLowerCase()));
+      f.specializations?.some(s => s.toLowerCase().includes(filterSpecialization.toLowerCase()));
     
     return matchesSearch && matchesSpecialization;
   });
 
   // Get unique specializations for filter
-  const allSpecializations = [...new Set(faculty.flatMap(f => f.specialization || []))];
+  const allSpecializations = [...new Set(faculty.flatMap(f => f.specializations || []))];
 
-  const hasActiveFilters = searchTerm || filterSpecialization;
+  // A program manager's locked program isn't a filter they can clear
+  const isProgramManager = user?.role === 'program_manager';
+  const hasActiveFilters = searchTerm || filterSpecialization || (filterProgram && !isProgramManager);
 
   // Calculate statistics
   const stats = {
@@ -119,7 +160,7 @@ const FacultyPage = () => {
     avgLoad: faculty.length > 0 
       ? Math.round(faculty.reduce((sum, f) => sum + (f.currentLoad || 0), 0) / faculty.length)
       : 0,
-    overloaded: faculty.filter(f => (f.currentLoad || 0) > f.maxLoad).length
+    overloaded: faculty.filter(f => (f.currentLoad || 0) > getMaxLoad(f)).length
   };
 
   return (
@@ -210,6 +251,25 @@ const FacultyPage = () => {
             {/* Filters */}
             <div className="flex flex-wrap gap-2">
               <select
+                value={filterProgram}
+                onChange={(e) => setFilterProgram(e.target.value)}
+                disabled={isProgramManager}
+                title={isProgramManager ? `You manage ${user.program}` : 'Filter by program'}
+                className="px-3 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-teal-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white text-sm transition-all disabled:bg-gray-100 dark:disabled:bg-gray-600"
+              >
+                {isProgramManager ? (
+                  <option value={user.program}>{user.program}</option>
+                ) : (
+                  <>
+                    <option value="">All Programs</option>
+                    {programCodes.map(prog => (
+                      <option key={prog} value={prog}>{prog}</option>
+                    ))}
+                  </>
+                )}
+              </select>
+
+              <select
                 value={filterSpecialization}
                 onChange={(e) => setFilterSpecialization(e.target.value)}
                 className="px-3 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-teal-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white text-sm transition-all"
@@ -262,6 +322,15 @@ const FacultyPage = () => {
                     />
                   </span>
                 )}
+                {filterProgram && !isProgramManager && (
+                  <span className="inline-flex items-center gap-1 px-2 py-1 bg-teal-100 dark:bg-teal-900 text-teal-700 dark:text-teal-300 text-xs rounded-md">
+                    Program: {filterProgram}
+                    <X 
+                      className="w-3 h-3 cursor-pointer hover:text-teal-900 dark:hover:text-teal-100" 
+                      onClick={() => setFilterProgram('')}
+                    />
+                  </span>
+                )}
                 {filterSpecialization && (
                   <span className="inline-flex items-center gap-1 px-2 py-1 bg-teal-100 dark:bg-teal-900 text-teal-700 dark:text-teal-300 text-xs rounded-md">
                     Specialization: {filterSpecialization}
@@ -275,6 +344,8 @@ const FacultyPage = () => {
                   onClick={() => {
                     setSearchTerm('');
                     setFilterSpecialization('');
+                    // A program manager's program stays locked
+                    if (!isProgramManager) setFilterProgram('');
                   }}
                   className="text-xs text-red-600 dark:text-red-400 hover:underline"
                 >
@@ -330,21 +401,78 @@ const FacultyPage = () => {
                     <h3 className="font-bold text-gray-900 dark:text-white text-base truncate">
                       {facultyMember.user?.firstName} {facultyMember.user?.lastName}
                     </h3>
+                    {facultyMember.position && (
+                      <p className="text-xs font-medium text-teal-700 dark:text-teal-400 truncate flex items-center gap-1">
+                        <Briefcase className="w-3 h-3 flex-shrink-0" />
+                        {facultyMember.position}
+                      </p>
+                    )}
                     <p className="text-xs text-gray-600 dark:text-gray-400 truncate flex items-center gap-1">
-                      <Mail className="w-3 h-3" />
+                      <Mail className="w-3 h-3 flex-shrink-0" />
                       {facultyMember.user?.email}
                     </p>
-                    <span className="inline-block mt-1 px-2 py-0.5 bg-teal-100 text-teal-800 dark:bg-teal-900 dark:text-teal-300 text-xs font-bold rounded">
-                      {facultyMember.employeeId}
-                    </span>
+                    {facultyMember.contactNumber && (
+                      <p className="text-xs text-gray-600 dark:text-gray-400 truncate flex items-center gap-1">
+                        <Phone className="w-3 h-3 flex-shrink-0" />
+                        {facultyMember.contactNumber}
+                      </p>
+                    )}
+                    <div className="flex flex-wrap items-center gap-1 mt-1">
+                      <span className="inline-block px-2 py-0.5 bg-teal-100 text-teal-800 dark:bg-teal-900 dark:text-teal-300 text-xs font-bold rounded">
+                        {facultyMember.employeeId}
+                      </span>
+                      {facultyMember.employmentType && (
+                        <span className={`inline-block px-2 py-0.5 text-xs font-semibold rounded ${
+                          facultyMember.employmentType === 'Part-time'
+                            ? 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-300'
+                            : 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-300'
+                        }`}>
+                          {facultyMember.employmentType}
+                        </span>
+                      )}
+                      {facultyMember.department && (
+                        <span className="inline-block px-2 py-0.5 bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300 text-xs font-semibold rounded">
+                          {facultyMember.department}
+                        </span>
+                      )}
+                    </div>
                   </div>
                 </div>
 
-                {/* Specializations */}
-                {facultyMember.specialization && facultyMember.specialization.length > 0 && (
-                  <div className="mb-4">
+                {/* Qualified Programs */}
+                <div className="mb-3">
+                  <p className="text-xs font-semibold text-gray-500 dark:text-gray-400 mb-1 flex items-center gap-1">
+                    <Layers className="w-3 h-3" />
+                    Qualified Programs
+                  </p>
+                  {getPrograms(facultyMember).length > 0 ? (
                     <div className="flex flex-wrap gap-1">
-                      {facultyMember.specialization.slice(0, 3).map((spec, idx) => (
+                      {getPrograms(facultyMember).map((prog) => (
+                        <span
+                          key={prog}
+                          className="inline-flex items-center px-2 py-1 rounded-md text-xs font-bold bg-indigo-100 text-indigo-800 dark:bg-indigo-900 dark:text-indigo-300"
+                        >
+                          {prog}
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 text-xs text-amber-700 dark:text-amber-400">
+                      <AlertCircle className="w-3 h-3" />
+                      None assigned
+                    </span>
+                  )}
+                </div>
+
+                {/* Specializations */}
+                {getSpecializations(facultyMember).length > 0 && (
+                  <div className="mb-3">
+                    <p className="text-xs font-semibold text-gray-500 dark:text-gray-400 mb-1 flex items-center gap-1">
+                      <BookOpen className="w-3 h-3" />
+                      Specializations
+                    </p>
+                    <div className="flex flex-wrap gap-1">
+                      {getSpecializations(facultyMember).slice(0, 3).map((spec, idx) => (
                         <span
                           key={idx}
                           className="inline-flex items-center px-2 py-1 rounded-md text-xs font-semibold bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-300"
@@ -352,11 +480,66 @@ const FacultyPage = () => {
                           {spec}
                         </span>
                       ))}
-                      {facultyMember.specialization.length > 3 && (
+                      {getSpecializations(facultyMember).length > 3 && (
                         <span className="inline-flex items-center px-2 py-1 rounded-md text-xs font-semibold bg-gray-100 text-gray-800 dark:bg-gray-900 dark:text-gray-300">
-                          +{facultyMember.specialization.length - 3}
+                          +{getSpecializations(facultyMember).length - 3}
                         </span>
                       )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Qualification / experience / rating */}
+                <div className="mb-3 space-y-1">
+                  {getTopQualification(facultyMember) && (
+                    <p className="text-xs text-gray-700 dark:text-gray-300 flex items-center gap-1.5">
+                      <GraduationCap className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400 flex-shrink-0" />
+                      <span className="truncate">{getTopQualification(facultyMember)}</span>
+                    </p>
+                  )}
+                  <div className="flex items-center gap-3">
+                    <p className="text-xs text-gray-700 dark:text-gray-300 flex items-center gap-1.5">
+                      <Clock className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400 flex-shrink-0" />
+                      {(facultyMember.teachingHistory || []).length} sem taught
+                    </p>
+                    <p className="text-xs text-gray-700 dark:text-gray-300 flex items-center gap-1.5">
+                      <Star className="w-3.5 h-3.5 text-amber-500 flex-shrink-0" />
+                      {getAverageRating(facultyMember)
+                        ? `${getAverageRating(facultyMember).toFixed(1)}/5.0`
+                        : 'Not rated'}
+                    </p>
+                  </div>
+                </div>
+
+                {/* Strongest subject experience, recency-weighted */}
+                {summarizeAllSubjects(facultyMember).length > 0 && (
+                  <div className="mb-3">
+                    <p className="text-xs font-semibold text-gray-500 dark:text-gray-400 mb-1 flex items-center gap-1">
+                      <TrendingUp className="w-3 h-3" />
+                      Most Experienced In
+                    </p>
+                    <div className="space-y-1">
+                      {summarizeAllSubjects(facultyMember).slice(0, 2).map((s) => (
+                        <div
+                          key={s.key}
+                          className="flex items-center justify-between gap-2 text-xs"
+                        >
+                          <span className="font-medium text-gray-800 dark:text-gray-200 truncate">
+                            {s.subjectCode || s.subjectName}
+                          </span>
+                          <span
+                            className={`flex-shrink-0 px-1.5 py-0.5 rounded font-medium ${
+                              s.isStale
+                                ? 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-300'
+                                : s.lastTaughtYearsAgo <= 1
+                                ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300'
+                                : 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300'
+                            }`}
+                          >
+                            {s.timesTaught}x · {describeRecency(s.lastTaughtYearsAgo)}
+                          </span>
+                        </div>
+                      ))}
                     </div>
                   </div>
                 )}
@@ -366,21 +549,24 @@ const FacultyPage = () => {
                   <div className="flex items-center justify-between text-sm mb-1.5">
                     <span className="text-gray-600 dark:text-gray-400 font-medium">Workload</span>
                     <span className="font-semibold text-gray-900 dark:text-white">
-                      {facultyMember.currentLoad || 0} / {facultyMember.maxLoad} hrs
+                      {facultyMember.currentLoad || 0} / {getMaxLoad(facultyMember)} units
                     </span>
                   </div>
                   <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2.5 overflow-hidden">
                     <div 
                       className={`h-full rounded-full transition-all duration-500 ${
-                        (facultyMember.currentLoad || 0) > facultyMember.maxLoad
+                        (facultyMember.currentLoad || 0) > getMaxLoad(facultyMember)
                           ? 'bg-red-600'
-                          : ((facultyMember.currentLoad || 0) / facultyMember.maxLoad) > 0.8
+                          : getLoadPercent(facultyMember) > 80
                           ? 'bg-orange-500'
                           : 'bg-green-600'
                       }`}
-                      style={{ width: `${Math.min(((facultyMember.currentLoad || 0) / facultyMember.maxLoad) * 100, 100)}%` }}
+                      style={{ width: `${getLoadPercent(facultyMember)}%` }}
                     />
                   </div>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                    {Math.max(getMaxLoad(facultyMember) - (facultyMember.currentLoad || 0), 0)} units available
+                  </p>
                 </div>
 
                 {/* Status Badge */}
@@ -438,6 +624,9 @@ const FacultyPage = () => {
                       Employee ID
                     </th>
                     <th className="px-4 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                      Programs
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300 uppercase tracking-wider">
                       Specialization
                     </th>
                     <th className="px-4 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300 uppercase tracking-wider">
@@ -466,6 +655,12 @@ const FacultyPage = () => {
                             <div className="text-sm font-medium text-gray-900 dark:text-white">
                               {facultyMember.user?.firstName} {facultyMember.user?.lastName}
                             </div>
+                            {facultyMember.position && (
+                              <div className="text-xs text-teal-700 dark:text-teal-400 font-medium">
+                                {facultyMember.position}
+                                {facultyMember.employmentType ? ` · ${facultyMember.employmentType}` : ''}
+                              </div>
+                            )}
                             <div className="text-sm text-gray-600 dark:text-gray-400 flex items-center">
                               <Mail className="w-3 h-3 mr-1" />
                               {facultyMember.user?.email}
@@ -480,7 +675,23 @@ const FacultyPage = () => {
                       </td>
                       <td className="px-4 py-4">
                         <div className="flex flex-wrap gap-1">
-                          {facultyMember.specialization?.slice(0, 2).map((spec, idx) => (
+                          {getPrograms(facultyMember).length > 0 ? (
+                            getPrograms(facultyMember).map((prog) => (
+                              <span
+                                key={prog}
+                                className="inline-flex items-center px-2 py-1 rounded-md text-xs font-bold bg-indigo-100 text-indigo-800 dark:bg-indigo-900 dark:text-indigo-300"
+                              >
+                                {prog}
+                              </span>
+                            ))
+                          ) : (
+                            <span className="text-xs text-amber-700 dark:text-amber-400">None</span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-4 py-4">
+                        <div className="flex flex-wrap gap-1">
+                          {getSpecializations(facultyMember).slice(0, 2).map((spec, idx) => (
                             <span
                               key={idx}
                               className="inline-flex items-center px-2 py-1 rounded-md text-xs font-semibold bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-300"
@@ -488,9 +699,9 @@ const FacultyPage = () => {
                               {spec}
                             </span>
                           ))}
-                          {facultyMember.specialization?.length > 2 && (
+                          {getSpecializations(facultyMember).length > 2 && (
                             <span className="inline-flex items-center px-2 py-1 rounded-md text-xs font-semibold bg-gray-100 text-gray-800 dark:bg-gray-900 dark:text-gray-300">
-                              +{facultyMember.specialization.length - 2}
+                              +{getSpecializations(facultyMember).length - 2}
                             </span>
                           )}
                         </div>
@@ -500,24 +711,19 @@ const FacultyPage = () => {
                           <div className="flex-1 min-w-[120px]">
                             <div className="flex items-center justify-between text-xs mb-1">
                               <span className="text-gray-600 dark:text-gray-400">
-                                {facultyMember.currentLoad || 0} / {facultyMember.maxLoad} hrs
+                                {facultyMember.currentLoad || 0} / {getMaxLoad(facultyMember)} units
                               </span>
                             </div>
                             <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
                               <div
                                 className={`h-2 rounded-full ${
-                                  (facultyMember.currentLoad || 0) > facultyMember.maxLoad
+                                  (facultyMember.currentLoad || 0) > getMaxLoad(facultyMember)
                                     ? 'bg-red-600'
-                                    : ((facultyMember.currentLoad || 0) / facultyMember.maxLoad) > 0.8
+                                    : getLoadPercent(facultyMember) > 80
                                     ? 'bg-orange-500'
                                     : 'bg-green-600'
                                 }`}
-                                style={{
-                                  width: `${Math.min(
-                                    ((facultyMember.currentLoad || 0) / facultyMember.maxLoad) * 100,
-                                    100
-                                  )}%`,
-                                }}
+                                style={{ width: `${getLoadPercent(facultyMember)}%` }}
                               ></div>
                             </div>
                           </div>

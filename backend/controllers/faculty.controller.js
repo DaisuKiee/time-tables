@@ -12,6 +12,7 @@ exports.getAllFaculty = async (req, res) => {
       isActive, 
       search, 
       specialization,
+      program,
       minLoad,
       maxLoad 
     } = req.query;
@@ -29,6 +30,15 @@ exports.getAllFaculty = async (req, res) => {
 
     if (specialization) {
       query.specializations = { $in: [specialization] };
+    }
+
+    // Filter by program: only faculty who can teach in this program, meaning
+    // they are either qualified for it or have taught it before.
+    if (program) {
+      query.$or = [
+        { programs: program },
+        { 'teachingHistory.program': program },
+      ];
     }
 
     // Load filtering
@@ -488,10 +498,23 @@ exports.getFacultyBySpecialization = async (req, res) => {
 // @access  Private
 exports.getAvailableFaculty = async (req, res) => {
   try {
-    const faculty = await Faculty.find({
+    const { program } = req.query;
+
+    const query = {
       isActive: true,
       $expr: { $lt: ['$currentLoad', '$maxTeachingLoad'] }
-    })
+    };
+
+    // Restrict to faculty qualified for (or previously teaching) this program.
+    // For program managers this is injected by checkProgramAccess.
+    if (program) {
+      query.$or = [
+        { programs: program },
+        { 'teachingHistory.program': program },
+      ];
+    }
+
+    const faculty = await Faculty.find(query)
     .populate('user', 'firstName lastName middleName email')
     .sort({ currentLoad: 1 });
 

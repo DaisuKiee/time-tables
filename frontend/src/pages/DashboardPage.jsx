@@ -44,11 +44,21 @@ const DashboardPage = () => {
     return () => clearTimeout(timer);
   }, []);
 
+  // These aggregate stats are only rendered for staff. Students and faculty have
+  // their own dashboard sections, so firing the staff endpoints for them just
+  // produced a row of 403s on every dashboard load.
+  const STAFF_ROLES = ['admin', 'scheduling_officer', 'program_manager'];
+  const canSeeStats = STAFF_ROLES.includes(user?.role);
+
   useEffect(() => {
-    loadDashboardStats();
+    if (canSeeStats) {
+      loadDashboardStats();
+    } else {
+      setLoading(false);
+    }
     const timer = setInterval(() => setCurrentTime(new Date()), 60000); // Update every minute
     return () => clearInterval(timer);
-  }, []);
+  }, [canSeeStats]);
 
   const loadDashboardStats = async () => {
     try {
@@ -177,34 +187,39 @@ const DashboardPage = () => {
             </p>
           </div>
           <div className="flex items-center gap-3">
-            <button
-              onClick={loadDashboardStats}
-              disabled={loading}
-              className="flex items-center gap-2 px-4 py-2 text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors disabled:opacity-50 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-600 dark:hover:bg-gray-700"
-            >
-              <RefreshCw size={18} className={loading ? 'animate-spin' : ''} />
-              Refresh
-            </button>
-            <button
-              onClick={() => setSelectedPeriod(selectedPeriod === 'month' ? 'quarter' : 'month')}
-              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-                selectedPeriod === 'month'
-                  ? 'bg-yellow-400 text-gray-900'
-                  : 'bg-white text-gray-700 border border-gray-300 hover:bg-gray-50 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-600 dark:hover:bg-gray-700'
-              }`}
-            >
-              This Month
-            </button>
-            <button
-              onClick={() => setSelectedPeriod(selectedPeriod === 'quarter' ? 'month' : 'quarter')}
-              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-                selectedPeriod === 'quarter'
-                  ? 'bg-yellow-400 text-gray-900'
-                  : 'bg-white text-gray-700 border border-gray-300 hover:bg-gray-50 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-600 dark:hover:bg-gray-700'
-              }`}
-            >
-              This Quarter
-            </button>
+            {/* Refresh and the period toggle only drive the staff stats */}
+            {canSeeStats && (
+              <>
+                <button
+                  onClick={loadDashboardStats}
+                  disabled={loading}
+                  className="flex items-center gap-2 px-4 py-2 text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors disabled:opacity-50 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-600 dark:hover:bg-gray-700"
+                >
+                  <RefreshCw size={18} className={loading ? 'animate-spin' : ''} />
+                  Refresh
+                </button>
+                <button
+                  onClick={() => setSelectedPeriod(selectedPeriod === 'month' ? 'quarter' : 'month')}
+                  className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                    selectedPeriod === 'month'
+                      ? 'bg-yellow-400 text-gray-900'
+                      : 'bg-white text-gray-700 border border-gray-300 hover:bg-gray-50 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-600 dark:hover:bg-gray-700'
+                  }`}
+                >
+                  This Month
+                </button>
+                <button
+                  onClick={() => setSelectedPeriod(selectedPeriod === 'quarter' ? 'month' : 'quarter')}
+                  className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                    selectedPeriod === 'quarter'
+                      ? 'bg-yellow-400 text-gray-900'
+                      : 'bg-white text-gray-700 border border-gray-300 hover:bg-gray-50 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-600 dark:hover:bg-gray-700'
+                  }`}
+                >
+                  This Quarter
+                </button>
+              </>
+            )}
           </div>
         </div>
 
@@ -748,25 +763,12 @@ const DashboardPage = () => {
         </div>
       )}
 
-      {/* Student Dashboard */}
+      {/* Student Dashboard.
+          This used to be two hardcoded placeholder cards ("Your enrolled classes
+          will appear here"), while the real StudentDashboard component below was
+          defined but never rendered. */}
       {user?.role === 'student' && (
-        <div className="space-y-6">
-          <div className="bg-white rounded-lg shadow p-6">
-            <h2 className="text-xl font-semibold text-gray-900 mb-4">My Enrolled Classes</h2>
-            <p className="text-gray-600">Your enrolled classes will appear here.</p>
-            <button
-              onClick={() => window.location.href = '/classes'}
-              className="mt-4 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
-            >
-              View My Classes
-            </button>
-          </div>
-          
-          <div className="bg-white rounded-lg shadow p-6">
-            <h2 className="text-xl font-semibold text-gray-900 mb-4">Class Schedule</h2>
-            <p className="text-gray-600">Your class schedule will appear here.</p>
-          </div>
-        </div>
+        <StudentDashboard user={user} loading={loading} />
       )}
       </div> {/* Close relative div */}
     </Layout>
@@ -780,7 +782,7 @@ export default DashboardPage;
 const StudentDashboard = ({ user, loading: parentLoading }) => {
   const [studentData, setStudentData] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [schedules, setSchedules] = useState([]);
+  const [classes, setClasses] = useState([]);
 
   useEffect(() => {
     loadStudentData();
@@ -788,37 +790,34 @@ const StudentDashboard = ({ user, loading: parentLoading }) => {
 
   const loadStudentData = async () => {
     try {
-      // Fetch student record
-      const studentRes = await studentAPI.getAll();
-      const allStudents = studentRes.data.data || [];
-      const myStudentRecord = allStudents.find(s => s.user?._id === user?._id || s.user === user?._id);
-      
-      setStudentData(myStudentRecord);
+      // One call. /my-classes returns the student's own profile plus the class
+      // spaces they're enrolled in, each with its populated schedule.
+      //
+      // The previous version fetched EVERY student record and picked itself out
+      // client-side, then matched `schedule.section` ("A") against
+      // `sectionCode` ("BSIT-4A-D") - which never matched, so the schedule was
+      // always empty.
+      const response = await classSpaceAPI.getMyClasses();
+      const payload = response.data;
 
-      // Fetch schedules if student has section or subjects
-      if (myStudentRecord) {
-        const scheduleRes = await scheduleAPI.getAll();
-        const allSchedules = scheduleRes.data.data || [];
-        
-        let mySchedules = [];
-        if (myStudentRecord.studentType === 'regular' && myStudentRecord.sectionCode) {
-          // Regular student: filter by section code
-          mySchedules = allSchedules.filter(s => s.section === myStudentRecord.sectionCode);
-        } else if (myStudentRecord.studentType === 'irregular' && myStudentRecord.subjectCodes?.length > 0) {
-          // Irregular student: filter by subject codes
-          mySchedules = allSchedules.filter(s => 
-            myStudentRecord.subjectCodes.includes(s.subject?.subjectCode || s.subject)
-          );
-        }
-        
-        setSchedules(mySchedules);
-      }
+      setStudentData(payload.profile || null);
+      setClasses(payload.data || []);
     } catch (error) {
       console.error('Failed to load student data:', error);
-      toast.error('Failed to load your enrollment information');
+      toast.error(
+        error.response?.data?.message || 'Failed to load your enrollment information'
+      );
     } finally {
       setLoading(false);
     }
+  };
+
+  /** "Monday 08:00-09:00" for the first meeting of a class. */
+  const describeSlots = (cs) => {
+    const slots = cs.schedule?.timeSlots || [];
+    if (slots.length === 0) return 'Schedule to be announced';
+    const first = `${slots[0].day} ${slots[0].startTime}-${slots[0].endTime}`;
+    return slots.length > 1 ? `${first} +${slots.length - 1} more` : first;
   };
 
   if (loading || parentLoading) {
@@ -939,46 +938,77 @@ const StudentDashboard = ({ user, loading: parentLoading }) => {
         )}
       </div>
 
-      {/* Schedule Card */}
+      {/* My Classes */}
       <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6 dark:bg-gray-800 dark:border-gray-700">
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
-            My Class Schedule
+            My Classes
           </h3>
           <button
-            onClick={() => window.location.href = '/schedules'}
+            onClick={() => window.location.href = '/classes'}
             className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-sm font-medium"
           >
-            View Full Schedule
+            Open Classes
           </button>
         </div>
 
-        {schedules.length === 0 ? (
+        {classes.length === 0 ? (
           <div className="text-center py-8 text-gray-500">
             <Calendar className="w-12 h-12 mx-auto mb-2 text-gray-300" />
-            <p>No schedule available yet</p>
-            <p className="text-sm mt-1">Check back later for your class schedule</p>
+            <p>You have no classes yet</p>
+            <p className="text-sm mt-1">
+              {studentData?.studentType === 'irregular'
+                ? 'Join a subject with a class code from your instructor.'
+                : 'Join your section with the enrollment code from your program manager.'}
+            </p>
+            <button
+              onClick={() => window.location.href = '/classes'}
+              className="mt-4 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-sm font-medium"
+            >
+              {studentData?.studentType === 'irregular' ? 'Join a Subject' : 'Join My Section'}
+            </button>
           </div>
         ) : (
           <div className="space-y-2">
             <p className="text-sm text-gray-600 dark:text-gray-400">
-              You have {schedules.length} scheduled {schedules.length === 1 ? 'class' : 'classes'}
+              You are enrolled in {classes.length} {classes.length === 1 ? 'class' : 'classes'}
             </p>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-4">
-              {schedules.slice(0, 4).map((schedule, index) => (
-                <div key={index} className="p-3 bg-gray-50 rounded-lg border border-gray-200 dark:bg-gray-700 dark:border-gray-600">
-                  <p className="font-medium text-gray-900 dark:text-gray-100">
-                    {typeof schedule.subject === 'object' ? schedule.subject.subjectName : schedule.subject}
-                  </p>
-                  <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-                    {schedule.day} • {schedule.timeSlot}
-                  </p>
-                </div>
-              ))}
+              {classes.slice(0, 4).map((cs) => {
+                const teacher = cs.faculty?.user
+                  ? `${cs.faculty.user.firstName || ''} ${cs.faculty.user.lastName || ''}`.trim()
+                  : null;
+                return (
+                  <div
+                    key={cs._id}
+                    onClick={() => window.location.href = '/classes'}
+                    className="p-3 bg-gray-50 rounded-lg border border-gray-200 hover:border-blue-400 cursor-pointer transition-colors dark:bg-gray-700 dark:border-gray-600"
+                  >
+                    <p className="font-medium text-gray-900 dark:text-gray-100">
+                      {cs.subject?.subjectCode || cs.sectionCode}
+                    </p>
+                    {cs.subject?.subjectName && (
+                      <p className="text-sm text-gray-600 dark:text-gray-400 line-clamp-1">
+                        {cs.subject.subjectName}
+                      </p>
+                    )}
+                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                      {describeSlots(cs)}
+                    </p>
+                    {teacher && (
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{teacher}</p>
+                    )}
+                    <div className="flex items-center gap-3 mt-2 text-xs text-gray-500 dark:text-gray-400">
+                      <span>{cs.announcements?.length || 0} announcements</span>
+                      <span>{cs.materials?.length || 0} materials</span>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
-            {schedules.length > 4 && (
+            {classes.length > 4 && (
               <p className="text-sm text-gray-500 text-center mt-3 dark:text-gray-400">
-                +{schedules.length - 4} more {schedules.length - 4 === 1 ? 'class' : 'classes'}
+                +{classes.length - 4} more {classes.length - 4 === 1 ? 'class' : 'classes'}
               </p>
             )}
           </div>

@@ -60,7 +60,11 @@ app.use('/api/', limiter);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Serve static files from uploads folder with CORS headers
+// Serve static files from uploads folder with CORS headers.
+// UPLOAD_ROOT is absolute, so this resolves the same way regardless of the
+// directory the server was started from (express.static('uploads') was
+// relative to the process CWD and silently served nothing otherwise).
+const { UPLOAD_ROOT } = require('./middleware/upload.middleware');
 app.use('/uploads', (req, res, next) => {
   const frontendUrl = (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, '');
   res.header('Access-Control-Allow-Origin', frontendUrl);
@@ -68,7 +72,7 @@ app.use('/uploads', (req, res, next) => {
   res.header('Access-Control-Allow-Headers', 'Content-Type');
   res.header('Cross-Origin-Resource-Policy', 'cross-origin');
   next();
-}, express.static('uploads'));
+}, express.static(UPLOAD_ROOT));
 
 // Compression middleware
 app.use(compression());
@@ -92,6 +96,7 @@ app.use('/api/schedules', require('./routes/schedule.routes'));
 app.use('/api/classSpaces', require('./routes/classSpace.routes'));
 app.use('/api/students', require('./routes/student.routes'));
 app.use('/api/sections', require('./routes/section.routes'));
+app.use('/api/programs', require('./routes/program.routes'));
 app.use('/api/activity-logs', require('./routes/activityLog.routes'));
 app.use('/api/ai', require('./routes/ai.routes'));
 app.use('/api/ai', require('./routes/aiChat.routes'));
@@ -117,6 +122,22 @@ app.use((req, res) => {
 
 // Global error handler
 app.use((err, req, res, next) => {
+  // Multer failures are client errors, not 500s. Without this an oversized or
+  // wrong-type upload surfaces as "Internal Server Error" with no explanation.
+  if (err && err.name === 'MulterError') {
+    const message = err.code === 'LIMIT_FILE_SIZE'
+      ? 'File is too large.'
+      : err.code === 'LIMIT_UNEXPECTED_FILE'
+      ? 'Unexpected file field.'
+      : err.message;
+    return res.status(400).json({ success: false, message });
+  }
+
+  // fileFilter rejections arrive as plain Errors
+  if (err && /Unsupported file type/i.test(err.message || '')) {
+    return res.status(400).json({ success: false, message: err.message });
+  }
+
   console.error(err.stack);
   res.status(err.status || 500).json({
     success: false,
