@@ -14,6 +14,7 @@ require('dotenv').config();
 
 // Import models
 const User = require('../models/User.model');
+const { getProgramCodes } = require('./programValidator');
 
 // Create readline interface for user input
 const rl = readline.createInterface({
@@ -25,7 +26,8 @@ const question = (query) => {
   return new Promise(resolve => rl.question(query, resolve));
 };
 
-const programs = ['BSIT', 'BSHM', 'BIT-ET', 'BIT-CT', 'BIT-AT', 'BSFI', 'BSIE'];
+// Populated from the database once connected (see models/Program.model.js)
+let programs = [];
 
 async function migrateToProgramManagers() {
   try {
@@ -33,6 +35,13 @@ async function migrateToProgramManagers() {
     console.log('🔗 Connecting to MongoDB...');
     await mongoose.connect(process.env.MONGODB_URI);
     console.log('✅ Connected to MongoDB\n');
+
+    programs = await getProgramCodes(true);
+    if (programs.length === 0) {
+      console.error('❌ No active programs found. Run `node seedPrograms.js` first.');
+      process.exit(1);
+    }
+    console.log(`📚 Loaded ${programs.length} programs: ${programs.join(', ')}\n`);
 
     // Find all scheduling officers
     const schedulingOfficers = await User.find({ role: 'scheduling_officer' });

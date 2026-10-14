@@ -5,19 +5,22 @@ import toast from 'react-hot-toast';
 import { 
   Plus, Search, Edit2, Trash2, BookOpen, 
   X, GraduationCap, Clock, FileText, Grid3x3, List,
-  Layers, TrendingUp, CheckCircle, Upload
+  Layers, TrendingUp, CheckCircle, Upload, Copy
 } from 'lucide-react';
 import SubjectModal from '../components/SubjectModal';
 import ExcelImportModal from '../components/ExcelImportModal';
+import ConfirmDialog from '../components/ConfirmDialog';
 import { useAuth } from '../context/AuthContext';
+import { usePrograms } from '../hooks/usePrograms';
 
-const PROGRAMS = ['BSIT', 'BSHM', 'BIT-ET', 'BIT-CT', 'BIT-AT', 'BSFI', 'BSIE'];
 const YEAR_LEVELS = [1, 2, 3, 4];
 const SEMESTERS = [1, 2];
 const SUBJECT_TYPES = ['Lecture', 'Laboratory', 'Both'];
 
 const SubjectPage = () => {
   const { user } = useAuth();
+  const { programCodes: PROGRAMS } = usePrograms();
+  
   const [subjects, setSubjects] = useState([]);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
@@ -38,6 +41,35 @@ const SubjectPage = () => {
     byProgram: {}
   });
 
+  // Confirm dialog state
+  const [confirmDialog, setConfirmDialog] = useState({
+    isOpen: false,
+    title: '',
+    message: '',
+    itemName: '',
+    onConfirm: null
+  });
+
+  // Load subjects data
+  const loadSubjects = async () => {
+    try {
+      setLoading(true);
+      const response = await subjectAPI.getAll({ isActive: true });
+      setSubjects(response.data?.data || response.data || []);
+    } catch (error) {
+      console.error('Error loading subjects:', error);
+      toast.error('Failed to load subjects');
+      setSubjects([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Initial load
+  useEffect(() => {
+    loadSubjects();
+  }, []);
+
   // Auto-set program filter for program managers
   useEffect(() => {
     if (user?.role === 'program_manager' && user?.program) {
@@ -45,13 +77,11 @@ const SubjectPage = () => {
     }
   }, [user]);
 
-  useEffect(() => {
-    loadSubjects();
-  }, []);
-
+  // PROGRAMS arrives asynchronously, so recompute once it loads
   useEffect(() => {
     calculateStats();
-  }, [subjects]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subjects, PROGRAMS]);
 
   // // Disable body scroll when modal is open
   // useEffect(() => {
@@ -65,21 +95,12 @@ const SubjectPage = () => {
   //   };
   // }, [showModal, showExcelImportModal]);
 
-  const loadSubjects = async () => {
-    try {
-      setLoading(true);
-      // Only load active subjects (excluding soft-deleted ones)
-      const response = await subjectAPI.getAll({ isActive: true });
-      setSubjects(response.data.data || []);
-    } catch (error) {
-      console.error('Load subjects error:', error);
-      toast.error('Failed to load subjects');
-    } finally {
-      setLoading(false);
-    }
-  };
-
   const calculateStats = () => {
+    if (!subjects || !Array.isArray(subjects)) {
+      // Keep existing stats if subjects not loaded yet
+      return;
+    }
+    
     const byProgram = {};
     PROGRAMS.forEach(prog => {
       byProgram[prog] = subjects.filter(s => s.program === prog).length;
@@ -104,49 +125,66 @@ const SubjectPage = () => {
     setShowModal(true);
   };
 
-  const handleDelete = async (id) => {
-    // Create a promise-based confirmation using toast
-    const confirmed = window.confirm('Are you sure you want to delete this subject?');
-    if (!confirmed) {
-      return;
-    }
-
-    try {
-      await subjectAPI.delete(id);
-      toast.success('Subject deleted successfully');
-      loadSubjects();
-    } catch (error) {
-      console.error('Delete error:', error);
-      
-      // Show specific error message from backend
-      const errorMessage = error.response?.data?.message || 
-                          error.message || 
-                          'Failed to delete subject';
-      
-      // If it's a program access error, show more specific message
-      if (error.response?.status === 403) {
-        const programError = error.response?.data?.message;
-        if (programError?.includes('program')) {
-          toast.error(programError);
-        } else {
-          toast.error('You do not have permission to delete this subject');
+  const handleDelete = async (subject) => {
+    setConfirmDialog({
+      isOpen: true,
+      title: 'Delete Subject',
+      message: 'Are you sure you want to delete this subject? This action cannot be undone.',
+      itemName: `${subject.subjectCode} - ${subject.subjectName}`,
+      onConfirm: async () => {
+        try {
+          await subjectAPI.delete(subject._id);
+          toast.success('Subject deleted successfully');
+          
+          // Reload subjects list
+          loadSubjects();
+          
+          setConfirmDialog({ ...confirmDialog, isOpen: false });
+        } catch (error) {
+          console.error('Delete error:', error);
+          
+          // Show specific error message from backend
+          const errorMessage = error.response?.data?.message || 
+                              error.message || 
+                              'Failed to delete subject';
+          
+          // If it's a program access error, show more specific message
+          if (error.response?.status === 403) {
+            const programError = error.response?.data?.message;
+            if (programError?.includes('program')) {
+              toast.error(programError);
+            } else {
+              toast.error('You do not have permission to delete this subject');
+            }
+          } else {
+            toast.error(errorMessage);
+          }
+          setConfirmDialog({ ...confirmDialog, isOpen: false });
         }
-      } else {
-        toast.error(errorMessage);
       }
-    }
+    });
+  };
+
+  const copySubjectCode = (code) => {
+    navigator.clipboard.writeText(code).then(() => {
+      toast.success(`Copied: ${code}`);
+    }).catch(() => {
+      toast.error('Failed to copy code');
+    });
   };
 
   const handleModalClose = (shouldRefresh) => {
     setShowModal(false);
     setSelectedSubject(null);
     if (shouldRefresh) {
+      // Reload subjects list
       loadSubjects();
     }
   };
 
   const handleExcelImportComplete = () => {
     setShowExcelImportModal(false);
+    // Reload subjects list
     loadSubjects();
   };
 
@@ -161,7 +199,7 @@ const SubjectPage = () => {
   };
 
   // Filter subjects
-  const filteredSubjects = subjects.filter((subject) => {
+  const filteredSubjects = (subjects || []).filter((subject) => {
     const matchesSearch = 
       subject.subjectCode?.toLowerCase().includes(searchTerm.toLowerCase()) ||
       subject.subjectName?.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -189,14 +227,14 @@ const SubjectPage = () => {
             <div className="flex gap-2">
               <button
                 onClick={() => setShowExcelImportModal(true)}
-                className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors shadow-md hover:shadow-lg"
+                className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg transition-colors shadow-md hover:shadow-lg"
               >
                 <Upload className="w-5 h-5" />
                 <span className="hidden sm:inline">Import</span>
               </button>
               <button
                 onClick={handleCreate}
-                className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg transition-colors shadow-md hover:shadow-lg"
+                className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition-colors shadow-md hover:shadow-lg"
               >
                 <Plus className="w-5 h-5" />
                 <span className="hidden sm:inline">Add Subject</span>
@@ -210,7 +248,7 @@ const SubjectPage = () => {
 
         {/* Statistics Cards */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-6">
-          <div className="bg-green-600 text-white rounded-xl p-4 shadow-md">
+          <div className="bg-indigo-600 text-white rounded-xl p-4 shadow-md">
             <div className="flex items-center justify-between mb-2">
               <BookOpen className="w-5 h-5 opacity-80" />
               <span className="text-xs font-medium opacity-80">TOTAL</span>
@@ -219,7 +257,7 @@ const SubjectPage = () => {
             <div className="text-xs opacity-80 mt-1">Subjects</div>
           </div>
 
-          <div className="bg-emerald-600 text-white rounded-xl p-4 shadow-md">
+          <div className="bg-green-600 text-white rounded-xl p-4 shadow-md">
             <div className="flex items-center justify-between mb-2">
               <CheckCircle className="w-5 h-5 opacity-80" />
               <span className="text-xs font-medium opacity-80">ACTIVE</span>
@@ -237,13 +275,13 @@ const SubjectPage = () => {
             <div className="text-xs opacity-80 mt-1">Total Programs</div>
           </div>
 
-          <div className="bg-purple-600 text-white rounded-xl p-4 shadow-md">
+          <div className="bg-orange-600 text-white rounded-xl p-4 shadow-md">
             <div className="flex items-center justify-between mb-2">
               <TrendingUp className="w-5 h-5 opacity-80" />
               <span className="text-xs font-medium opacity-80">AVERAGE</span>
             </div>
             <div className="text-2xl md:text-3xl font-bold">
-              {stats.total > 0 ? Math.round(stats.total / PROGRAMS.length) : 0}
+              {stats.total > 0 && PROGRAMS.length > 0 ? Math.round(stats.total / PROGRAMS.length) : 0}
             </div>
             <div className="text-xs opacity-80 mt-1">Per Program</div>
           </div>
@@ -260,7 +298,7 @@ const SubjectPage = () => {
                 placeholder="Search by subject code, name, or description..."
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
-                className="w-full pl-10 pr-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white transition-all"
+                className="w-full pl-10 pr-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white transition-all"
               />
             </div>
 
@@ -287,7 +325,7 @@ const SubjectPage = () => {
               <select
                 value={filters.yearLevel}
                 onChange={(e) => setFilters({ ...filters, yearLevel: e.target.value })}
-                className="px-3 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white text-sm transition-all"
+                className="px-3 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white text-sm transition-all"
               >
                 <option value="">All Years</option>
                 {YEAR_LEVELS.map(year => (
@@ -298,7 +336,7 @@ const SubjectPage = () => {
               <select
                 value={filters.semester}
                 onChange={(e) => setFilters({ ...filters, semester: e.target.value })}
-                className="px-3 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white text-sm transition-all"
+                className="px-3 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white text-sm transition-all"
               >
                 <option value="">All Semesters</option>
                 {SEMESTERS.map(sem => (
@@ -312,7 +350,7 @@ const SubjectPage = () => {
                   onClick={() => setViewMode('grid')}
                   className={`px-3 py-2 transition-colors ${
                     viewMode === 'grid' 
-                      ? 'bg-green-600 text-white' 
+                      ? 'bg-indigo-600 text-white' 
                       : 'bg-white dark:bg-gray-700 text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-600'
                   }`}
                   title="Grid View"
@@ -323,7 +361,7 @@ const SubjectPage = () => {
                   onClick={() => setViewMode('list')}
                   className={`px-3 py-2 border-l border-gray-300 dark:border-gray-600 transition-colors ${
                     viewMode === 'list' 
-                      ? 'bg-green-600 text-white' 
+                      ? 'bg-indigo-600 text-white' 
                       : 'bg-white dark:bg-gray-700 text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-600'
                   }`}
                   title="List View"
@@ -340,37 +378,37 @@ const SubjectPage = () => {
               <span className="text-sm text-gray-600 dark:text-gray-400">Active filters:</span>
               <div className="flex flex-wrap gap-2">
                 {searchTerm && (
-                  <span className="inline-flex items-center gap-1 px-2 py-1 bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300 text-xs rounded-md">
+                  <span className="inline-flex items-center gap-1 px-2 py-1 bg-indigo-100 dark:bg-indigo-900 text-indigo-700 dark:text-indigo-300 text-xs rounded-md">
                     Search: {searchTerm}
                     <X 
-                      className="w-3 h-3 cursor-pointer hover:text-green-900 dark:hover:text-green-100" 
+                      className="w-3 h-3 cursor-pointer hover:text-indigo-900 dark:hover:text-indigo-100" 
                       onClick={() => setSearchTerm('')}
                     />
                   </span>
                 )}
                 {filters.program && (
-                  <span className="inline-flex items-center gap-1 px-2 py-1 bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300 text-xs rounded-md">
+                  <span className="inline-flex items-center gap-1 px-2 py-1 bg-indigo-100 dark:bg-indigo-900 text-indigo-700 dark:text-indigo-300 text-xs rounded-md">
                     Program: {filters.program}
                     <X 
-                      className="w-3 h-3 cursor-pointer hover:text-green-900 dark:hover:text-green-100" 
+                      className="w-3 h-3 cursor-pointer hover:text-indigo-900 dark:hover:text-indigo-100" 
                       onClick={() => setFilters({ ...filters, program: '' })}
                     />
                   </span>
                 )}
                 {filters.yearLevel && (
-                  <span className="inline-flex items-center gap-1 px-2 py-1 bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300 text-xs rounded-md">
+                  <span className="inline-flex items-center gap-1 px-2 py-1 bg-indigo-100 dark:bg-indigo-900 text-indigo-700 dark:text-indigo-300 text-xs rounded-md">
                     Year: {filters.yearLevel}
                     <X 
-                      className="w-3 h-3 cursor-pointer hover:text-green-900 dark:hover:text-green-100" 
+                      className="w-3 h-3 cursor-pointer hover:text-indigo-900 dark:hover:text-indigo-100" 
                       onClick={() => setFilters({ ...filters, yearLevel: '' })}
                     />
                   </span>
                 )}
                 {filters.semester && (
-                  <span className="inline-flex items-center gap-1 px-2 py-1 bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300 text-xs rounded-md">
+                  <span className="inline-flex items-center gap-1 px-2 py-1 bg-indigo-100 dark:bg-indigo-900 text-indigo-700 dark:text-indigo-300 text-xs rounded-md">
                     Semester: {filters.semester}
                     <X 
-                      className="w-3 h-3 cursor-pointer hover:text-green-900 dark:hover:text-green-100" 
+                      className="w-3 h-3 cursor-pointer hover:text-indigo-900 dark:hover:text-indigo-100" 
                       onClick={() => setFilters({ ...filters, semester: '' })}
                     />
                   </span>
@@ -397,18 +435,18 @@ const SubjectPage = () => {
           <div className="text-center py-16 bg-white dark:bg-gray-800 rounded-xl border-2 border-dashed border-gray-300 dark:border-gray-600">
             <BookOpen className="w-20 h-20 text-gray-400 mx-auto mb-4" />
             <h3 className="text-xl font-semibold text-gray-900 dark:text-white mb-2">
-              {subjects.length === 0 ? 'No subjects created yet' : 'No subjects match your filters'}
+              {(subjects || []).length === 0 ? 'No subjects created yet' : 'No subjects match your filters'}
             </h3>
             <p className="text-gray-600 dark:text-gray-400 mb-6">
-              {subjects.length === 0 
+              {(subjects || []).length === 0 
                 ? 'Get started by creating your first subject'
                 : 'Try adjusting your search or filter criteria'
               }
             </p>
-            {subjects.length === 0 && (
+            {(subjects || []).length === 0 && (
               <button
                 onClick={handleCreate}
-                className="px-6 py-3 bg-green-600 hover:bg-green-700 text-white rounded-lg transition-colors inline-flex items-center gap-2"
+                className="px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition-colors inline-flex items-center gap-2"
               >
                 <Plus className="w-5 h-5" />
                 Create First Subject
@@ -426,7 +464,7 @@ const SubjectPage = () => {
                 <div className="flex items-start justify-between mb-4">
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 mb-2">
-                      <span className="px-2.5 py-1 bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300 text-xs font-bold rounded">
+                      <span className="px-2.5 py-1 bg-indigo-100 text-indigo-800 dark:bg-indigo-900 dark:text-indigo-300 text-xs font-bold rounded">
                         {subject.subjectCode}
                       </span>
                       <span className={`px-2.5 py-1 text-xs font-semibold rounded-full ${
@@ -446,8 +484,8 @@ const SubjectPage = () => {
                 {/* Details */}
                 <div className="space-y-2.5 mb-4">
                   <div className="flex items-center gap-2 text-sm">
-                    <div className="w-6 h-6 bg-green-100 dark:bg-green-900 rounded-full flex items-center justify-center flex-shrink-0">
-                      <GraduationCap className="w-3.5 h-3.5 text-green-600 dark:text-green-400" />
+                    <div className="w-6 h-6 bg-indigo-100 dark:bg-indigo-900 rounded-full flex items-center justify-center flex-shrink-0">
+                      <GraduationCap className="w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400" />
                     </div>
                     <div className="flex-1 min-w-0">
                       <p className="text-gray-600 dark:text-gray-400 text-xs">Program & Level</p>
@@ -496,14 +534,22 @@ const SubjectPage = () => {
                 {/* Actions */}
                 <div className="flex gap-2 pt-3 border-t border-gray-200 dark:border-gray-700">
                   <button
+                    onClick={() => copySubjectCode(subject.subjectCode)}
+                    className="flex items-center justify-center gap-2 px-3 py-2.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-all shadow-sm hover:shadow-md font-medium"
+                    title="Copy subject code"
+                  >
+                    <Copy className="w-4 h-4" />
+                    Copy
+                  </button>
+                  <button
                     onClick={() => handleEdit(subject)}
-                    className="flex-1 flex items-center justify-center gap-2 px-3 py-2.5 text-sm bg-green-600 hover:bg-green-700 text-white rounded-lg transition-all shadow-sm hover:shadow-md font-medium"
+                    className="flex-1 flex items-center justify-center gap-2 px-3 py-2.5 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition-all shadow-sm hover:shadow-md font-medium"
                   >
                     <Edit2 className="w-4 h-4" />
                     Edit
                   </button>
                   <button
-                    onClick={() => handleDelete(subject._id)}
+                    onClick={() => handleDelete(subject)}
                     className="flex-1 flex items-center justify-center gap-2 px-3 py-2.5 text-sm bg-red-600 hover:bg-red-700 text-white rounded-lg transition-all shadow-sm hover:shadow-md font-medium"
                   >
                     <Trash2 className="w-4 h-4" />
@@ -588,14 +634,21 @@ const SubjectPage = () => {
                       <td className="px-4 py-4 whitespace-nowrap text-right">
                         <div className="flex items-center justify-end gap-2">
                           <button
+                            onClick={() => copySubjectCode(subject.subjectCode)}
+                            className="p-2 text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900 rounded-lg transition-colors"
+                            title="Copy Code"
+                          >
+                            <Copy className="w-4 h-4" />
+                          </button>
+                          <button
                             onClick={() => handleEdit(subject)}
-                            className="p-2 text-green-600 hover:bg-green-50 dark:hover:bg-green-900 rounded-lg transition-colors"
+                            className="p-2 text-indigo-600 hover:bg-indigo-50 dark:hover:bg-indigo-900 rounded-lg transition-colors"
                             title="Edit"
                           >
                             <Edit2 className="w-4 h-4" />
                           </button>
                           <button
-                            onClick={() => handleDelete(subject._id)}
+                            onClick={() => handleDelete(subject)}
                             className="p-2 text-red-600 hover:bg-red-50 dark:hover:bg-red-900 rounded-lg transition-colors"
                             title="Delete"
                           >
@@ -628,6 +681,16 @@ const SubjectPage = () => {
           onComplete={handleExcelImportComplete}
         />
       )}
+
+      {/* Confirm Dialog */}
+      <ConfirmDialog
+        isOpen={confirmDialog.isOpen}
+        onClose={() => setConfirmDialog({ ...confirmDialog, isOpen: false })}
+        onConfirm={confirmDialog.onConfirm}
+        title={confirmDialog.title}
+        message={confirmDialog.message}
+        itemName={confirmDialog.itemName}
+      />
     </Layout>
   );
 };

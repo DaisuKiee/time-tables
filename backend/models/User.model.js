@@ -1,6 +1,8 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 
+const { isValidProgramCode } = require('../utils/programValidator');
+
 const UserSchema = new mongoose.Schema({
   email: {
     type: String,
@@ -60,17 +62,29 @@ const UserSchema = new mongoose.Schema({
   },
   program: {
     type: String,
-    enum: ['BSIT', 'BSHM', 'BIT-ET', 'BIT-CT', 'BIT-AT', 'BSFI', 'BSIE', null],
     default: null,
+    trim: true,
     validate: {
-      validator: function(value) {
-        // If role is program_manager, program is required
-        if (this.role === 'program_manager') {
-          return value !== null && value !== undefined;
+      validator: async function(value) {
+        const isEmpty = value === null || value === undefined || value === '';
+
+        // Program managers must be tied to a program
+        if (this.role === 'program_manager' && isEmpty) {
+          return false;
         }
-        return true;
+
+        // Everyone else may leave it blank
+        if (isEmpty) return true;
+
+        // Whatever is set must be a real, active program
+        return isValidProgramCode(value);
       },
-      message: 'Program is required for program managers'
+      message: function(props) {
+        if (this.role === 'program_manager' && !props.value) {
+          return 'Program is required for program managers';
+        }
+        return `'${props.value}' is not a valid program. It must match an active program code in the database.`;
+      }
     }
   },
   shift: {

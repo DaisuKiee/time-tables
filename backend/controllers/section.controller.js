@@ -1,17 +1,6 @@
 const Section = require('../models/Section.model');
 const ClassSpace = require('../models/ClassSpace.model');
 
-// Helper: generate a unique enrollment code for a ClassSpace
-const generateUniqueEnrollmentCode = async () => {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let code, exists;
-  do {
-    code = Array.from({ length: 8 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
-    exists = await ClassSpace.findOne({ enrollmentCode: code });
-  } while (exists);
-  return code;
-};
-
 // @desc    Get all sections
 // @route   GET /api/sections
 // @access  Private
@@ -96,6 +85,21 @@ exports.createSection = async (req, res) => {
   try {
     const { program, yearLevel, sectionLetter, shift, academicYear, semester, maxStudents, adviser, description } = req.body;
 
+    // Validate that faculty can only have one advisory role
+    if (adviser && adviser !== '') {
+      const existingAdvisory = await Section.findOne({ 
+        adviser: adviser,
+        isActive: true 
+      });
+      
+      if (existingAdvisory) {
+        return res.status(400).json({
+          success: false,
+          message: `This faculty is already assigned as adviser to section ${existingAdvisory.sectionCode}. Each faculty can only advise one section.`
+        });
+      }
+    }
+
     // Auto-generate section code: PROGRAM-YEAR-LETTER-SHIFT
     const sectionCode = `${program}-${yearLevel}${sectionLetter}-${shift.substring(0, 1)}`;
 
@@ -136,18 +140,11 @@ exports.createSection = async (req, res) => {
     section.enrollmentCode = enrollmentCode;
     await section.save();
 
-    // Auto-create a ClassSpace for this section so students can enroll immediately
-    const existingCS = await ClassSpace.findOne({ sectionCode });
-    if (!existingCS) {
-      await ClassSpace.create({
-        sectionCode,
-        enrollmentCode,
-        announcements: [],
-        materials: [],
-        enrolledStudents: [],
-        isActive: true
-      });
-    }
+    // No ClassSpace is created here on purpose.
+    // A ClassSpace represents one SUBJECT offering, so spaces are created from
+    // schedules (see classSpace.controller.ensureClassSpaceForSchedule). The
+    // section's enrollmentCode above is the single code regular students use to
+    // join, which then enrolls them in every subject of the section.
 
     const populatedSection = await Section.findById(section._id)
       .populate('adviser', 'employeeId user')
@@ -195,6 +192,29 @@ exports.updateSection = async (req, res) => {
     }
 
     const { program, yearLevel, sectionLetter, shift, academicYear, semester, maxStudents, adviser, description, isActive, currentStudents } = req.body;
+
+    // Validate that faculty can only have one advisory role
+    // Only check if adviser is being changed and is not empty
+    if (adviser !== undefined && adviser !== '' && adviser !== null) {
+      // Check if this is a different adviser than the current one
+      const currentAdviserId = section.adviser?.toString();
+      const newAdviserId = adviser.toString();
+      
+      if (currentAdviserId !== newAdviserId) {
+        const existingAdvisory = await Section.findOne({ 
+          adviser: adviser,
+          _id: { $ne: section._id }, // Exclude current section
+          isActive: true 
+        });
+        
+        if (existingAdvisory) {
+          return res.status(400).json({
+            success: false,
+            message: `This faculty is already assigned as adviser to section ${existingAdvisory.sectionCode}. Each faculty can only advise one section.`
+          });
+        }
+      }
+    }
 
     // Update fields
     if (program) section.program = program;

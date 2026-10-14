@@ -1,10 +1,19 @@
 import os
 from google import genai
 
-# Initialize with OpenRouter's endpoint and your free OpenRouter key
-client = genai.Client(
-    api_key="AIzaSyBdhGnhQlWj8s5356x8A1V5pewyof6gBGs"
-)
+# Read the key from the environment. Never hardcode credentials here:
+# this file is committed to the repository, and a literal key published to
+# a public remote will be detected and revoked automatically.
+#
+#   PowerShell:  $env:GEMINI_API_KEY_1 = "your-key"
+#   bash:        export GEMINI_API_KEY_1="your-key"
+api_key = os.environ.get("GEMINI_API_KEY_1")
+if not api_key:
+    raise SystemExit(
+        "GEMINI_API_KEY_1 is not set. Export it before running this script."
+    )
+
+client = genai.Client(api_key=api_key)
 
 stream = client.interactions.create(
     model="gemini-3.6-flash",

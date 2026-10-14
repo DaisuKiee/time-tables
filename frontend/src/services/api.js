@@ -3,7 +3,7 @@ import axios from 'axios';
 // Create axios instance with default config
 const api = axios.create({
   baseURL: process.env.REACT_APP_API_URL || 'http://localhost:5000/api',
-  timeout: 30000,
+  timeout: 60000, // Increased to 60 seconds for Render free tier spin-up
   headers: {
     'Content-Type': 'application/json'
   }
@@ -28,10 +28,21 @@ api.interceptors.response.use(
   (response) => response,
   (error) => {
     if (error.response?.status === 401) {
-      // Unauthorized - clear token and redirect to login
-      localStorage.removeItem('token');
-      localStorage.removeItem('user');
-      window.location.href = '/';
+      // Unauthorized - BUT: Don't redirect if this is a login/register/auth attempt
+      // Only redirect if this is an authenticated endpoint failing (expired token)
+      const isAuthEndpoint = error.config?.url?.includes('/auth/login') || 
+                            error.config?.url?.includes('/auth/register') ||
+                            error.config?.url?.includes('/auth/signup') ||
+                            error.config?.url?.includes('/auth/forgot-password') ||
+                            error.config?.url?.includes('/auth/reset-password');
+      
+      if (!isAuthEndpoint) {
+        // Clear token and redirect to home only for expired/invalid tokens on protected routes
+        localStorage.removeItem('token');
+        localStorage.removeItem('user');
+        window.location.href = '/';
+      }
+      // If it's an auth endpoint, let the page handle the error (don't redirect)
     } else if (error.response?.status === 403) {
       // Forbidden - log the error but don't redirect
       // Let individual pages handle 403 errors as needed
@@ -67,7 +78,9 @@ export const authAPI = {
   changePassword: (data) => api.put('/auth/change-password', data),
   getSettings: () => api.get('/auth/settings'),
   updateSettings: (data) => api.put('/auth/settings', data),
-  logout: () => api.post('/auth/logout')
+  logout: () => api.post('/auth/logout'),
+  forgotPassword: (data) => api.post('/auth/forgot-password', data),
+  resetPassword: (token, data) => api.post(`/auth/reset-password/${token}`, data)
 };
 
 // ============== USER ENDPOINTS ==============
@@ -131,7 +144,8 @@ export const subjectAPI = {
   getByProgramAndYear: (program, year) => api.get(`/subjects/program/${program}/year/${year}`),
   getStats: () => api.get('/subjects/stats'),
   bulkImport: (data) => api.post('/subjects/bulk-import', data),
-  getByQualification: (qualification) => api.get(`/subjects/qualification/${qualification}`)
+  getByQualification: (qualification) => api.get(`/subjects/qualification/${qualification}`),
+  generateCode: () => api.post('/subjects/generate-code')
 };
 
 // ============== ROOM ENDPOINTS ==============
@@ -146,23 +160,50 @@ export const roomAPI = {
   getStats: () => api.get('/rooms/stats')
 };
 
+// ============== PROGRAM ENDPOINTS ==============
+export const programAPI = {
+  getAll: (params) => api.get('/programs', { params }),
+  getById: (id) => api.get(`/programs/${id}`),
+  create: (data) => api.post('/programs', data),
+  update: (id, data) => api.put(`/programs/${id}`, data),
+  delete: (id) => api.delete(`/programs/${id}`)
+};
+
+/**
+ * Client timeout for a solver-backed request: the solver's own budget plus
+ * headroom for data loading, the Python process and JSON transfer.
+ */
+const solverTimeout = (data) => {
+  const limit = Number(data?.timeLimit) || 60;
+  return (limit + 45) * 1000;
+};
+
 // ============== SCHEDULE ENDPOINTS ==============
 export const scheduleAPI = {
   getAll: (params) => api.get('/schedules', { params }),
   getById: (id) => api.get(`/schedules/${id}`),
   create: (data) => api.post('/schedules', data),
+  // Validates the whole batch and writes all-or-nothing, so a partial failure
+  // can't leave some rows saved while the client still holds them as pending.
+  bulkCreate: (schedules) => api.post('/schedules/bulk', { schedules }),
   update: (id, data) => api.put(`/schedules/${id}`, data),
   delete: (id) => api.delete(`/schedules/${id}`),
+  batchDelete: (ids) => api.post('/schedules/batch-delete', { ids }),
   getByProgramAndYear: (program, year, params) => 
     api.get(`/schedules/program/${program}/year/${year}`, { params }),
   getFacultySchedule: (facultyId, params) => 
     api.get(`/schedules/faculty/${facultyId}`, { params }),
   checkConflicts: (data) => api.post('/schedules/check-conflicts', data),
   publish: (data) => api.post('/schedules/publish', data),
-  generate: (data) => api.post('/schedules/generate', data),
-  preview: (data) => api.post('/schedules/preview', data),
+  // Schedule generation runs a constraint solver server-side for up to
+  // `timeLimit` seconds, so the client has to wait longer than the 30s default
+  // or the request is aborted before the solver can possibly answer
+  // ("timeout of 30000ms exceeded" with the default 60s limit).
+  generate: (data) => api.post('/schedules/generate', data, { timeout: solverTimeout(data) }),
+  preview: (data) => api.post('/schedules/preview', data, { timeout: solverTimeout(data) }),
   savePreview: (data) => api.post('/schedules/save-preview', data),
-  checkORToolsStatus: () => api.get('/schedules/ortools-status')
+  checkORToolsStatus: () => api.get('/schedules/ortools-status'),
+  getConflicts: (summary = false) => api.get(`/schedules/conflicts${summary ? '?summary=true' : ''}`)
 };
 
 // ============== AI ENDPOINTS ==============
@@ -197,31 +238,45 @@ export const importAPI = {
 export const classSpaceAPI = {
   getAll: (params) => api.get('/classSpaces', { params }),
   getById: (id) => api.get(`/classSpaces/${id}`),
-  getByCode: (code) => api.get(`/classSpaces/code/${code}`),
   getMyClasses: () => api.get('/classSpaces/my-classes'),
   create: (data) => api.post('/classSpaces', data),
   update: (id, data) => api.put(`/classSpaces/${id}`, data),
   delete: (id) => api.delete(`/classSpaces/${id}`),
-  
+  regenerateClassCode: (id) => api.put(`/classSpaces/${id}/regenerate-code`),
+
   // Announcements
   postAnnouncement: (id, data) => api.post(`/classSpaces/${id}/announcements`, data),
-  updateAnnouncement: (id, announcementId, data) => 
+  updateAnnouncement: (id, announcementId, data) =>
     api.put(`/classSpaces/${id}/announcements/${announcementId}`, data),
-  deleteAnnouncement: (id, announcementId) => 
+  deleteAnnouncement: (id, announcementId) =>
     api.delete(`/classSpaces/${id}/announcements/${announcementId}`),
-  
+
   // Materials
-  uploadMaterial: (id, formData) => 
+  uploadMaterial: (id, formData) =>
     api.post(`/classSpaces/${id}/materials`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' }
     }),
-  deleteMaterial: (id, materialId) => 
+  deleteMaterial: (id, materialId) =>
     api.delete(`/classSpaces/${id}/materials/${materialId}`),
+
+  // Enrollment.
+  // Regular students pass a SECTION enrollment code; irregular students pass a
+  // SUBJECT class code. The backend routes on the student's studentType.
+  join: (code) => api.post('/classSpaces/join', { code }),
+  leave: (id) => api.post(`/classSpaces/${id}/leave`),
   
-  // Enrollment
-  enroll: (id, data) => api.post(`/classSpaces/${id}/enroll`, data),
-  unenroll: (id) => api.post(`/classSpaces/${id}/unenroll`),
-  enrollByCode: (enrollmentCode) => api.post('/classSpaces/enroll-by-code', { enrollmentCode })
+  // Self-enrollment with class code (for irregular students)
+  enrollByCode: (classCode) => api.post('/classSpaces/enroll-by-code', { classCode }),
+  unenroll: (id) => api.delete(`/classSpaces/${id}/unenroll`)
+};
+
+/** Absolute URL for an uploaded material. */
+export const resolveUploadUrl = (fileUrl) => {
+  if (!fileUrl) return '';
+  if (/^https?:\/\//i.test(fileUrl)) return fileUrl;
+  // API_URL ends with /api; uploads are served from the server root.
+  const apiUrl = process.env.REACT_APP_API_URL || 'http://localhost:5000/api';
+  return `${apiUrl.replace(/\/api\/?$/, '')}${fileUrl}`;
 };
 
 // ============== SECTION ENDPOINTS ==============
@@ -238,3 +293,13 @@ export const sectionAPI = {
 };
 
 export default api;
+
+
+// ============== NOTIFICATION ENDPOINTS ==============
+export const notificationAPI = {
+  getAll: (params) => api.get('/notifications', { params }),
+  getUnreadCount: () => api.get('/notifications/unread-count'),
+  markAsRead: (id) => api.put(`/notifications/${id}/read`),
+  markAllAsRead: () => api.put('/notifications/mark-all-read'),
+  delete: (id) => api.delete(`/notifications/${id}`),
+};

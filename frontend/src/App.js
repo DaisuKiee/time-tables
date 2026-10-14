@@ -3,6 +3,8 @@ import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-d
 import { Toaster } from 'react-hot-toast';
 import { AuthProvider } from './context/AuthContext';
 import { ThemeProvider } from './context/ThemeContext';
+import { PageStateProvider } from './context/PageStateContext';
+import { CacheProvider } from './context/CacheContext';
 import ProtectedRoute from './components/ProtectedRoute';
 import './i18n'; // Initialize i18n
 
@@ -10,6 +12,8 @@ import './i18n'; // Initialize i18n
 import LandingPage from './pages/LandingPage';
 import LoginPage from './pages/LoginPage';
 import SignupPage from './pages/SignupPage';
+import ForgotPasswordPage from './pages/ForgotPasswordPage';
+import ResetPasswordPage from './pages/ResetPasswordPage';
 import EmailVerificationPage from './pages/EmailVerificationPage';
 import DebugAuthPage from './pages/DebugAuthPage';
 import TestLoginPage from './pages/TestLoginPage';
@@ -26,6 +30,7 @@ import StudentPage from './pages/StudentPage';
 import ProfilePage from './pages/ProfilePage';
 import AnalyticsPage from './pages/AnalyticsPage';
 import AIInsightsPage from './pages/AIInsightsPage';
+import ActivityLogPage from './pages/ActivityLogPage';
 import SettingsPage from './pages/SettingsPage';
 import AccessDeniedPage from './pages/AccessDeniedPage';
 import NotFoundPage from './pages/NotFoundPage';
@@ -34,18 +39,21 @@ function App() {
   return (
     <AuthProvider>
       <ThemeProvider>
-        <Router future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
-          <div className="min-h-screen bg-gray-50">
-          <Toaster 
-            position="top-right"
-            toastOptions={{
-              duration: 3000,
-              style: {
-                background: '#363636',
-                color: '#fff',
-              },
-              success: {
+        <CacheProvider>
+          <PageStateProvider>
+          <Router future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+            <div className="min-h-screen bg-gray-50">
+            <Toaster 
+              position="top-right"
+              toastOptions={{
                 duration: 3000,
+                style: {
+                  background: '#363636',
+                  color: '#fff',
+                  zIndex: 99999, // Ensure toasts appear above modals
+                },
+                success: {
+                  duration: 3000,
                 iconTheme: {
                   primary: '#10B981',
                   secondary: '#fff',
@@ -59,6 +67,9 @@ function App() {
                 },
               },
             }}
+            containerStyle={{
+              zIndex: 99999, // Container also needs high z-index
+            }}
           />
           <Routes>
             <Route path="/" element={<LandingPage />} />
@@ -66,6 +77,8 @@ function App() {
             <Route path="/login" element={<LoginPage />} />
             <Route path="/test-login" element={<TestLoginPage />} />
             <Route path="/signup" element={<SignupPage />} />
+            <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+            <Route path="/reset-password/:token" element={<ResetPasswordPage />} />
             <Route path="/verify-email/:token" element={<EmailVerificationPage />} />
             <Route path="/debug-auth" element={<DebugAuthPage />} />
             <Route path="/dashboard-test" element={<DashboardPage />} />
@@ -166,11 +179,21 @@ function App() {
                 </ProtectedRoute>
               } 
             />
+            <Route 
+              path="/activity" 
+              element={
+                <ProtectedRoute allowedRoles={['admin', 'scheduling_officer', 'program_manager']}>
+                  <ActivityLogPage />
+                </ProtectedRoute>
+              } 
+            />
             <Route path="/access-denied" element={<AccessDeniedPage />} />
             <Route path="*" element={<NotFoundPage />} />
           </Routes>
         </div>
       </Router>
+      </PageStateProvider>
+        </CacheProvider>
       </ThemeProvider>
     </AuthProvider>
   );

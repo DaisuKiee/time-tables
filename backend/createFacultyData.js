@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const User = require('./models/User.model');
 const Faculty = require('./models/Faculty.model');
+const { getProgramCodes } = require('./utils/programValidator');
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
@@ -10,8 +11,13 @@ const createFacultyData = async () => {
     await mongoose.connect(process.env.MONGODB_URI);
     console.log('Connected to MongoDB');
 
-    // All 7 programs in the system
-    const programs = ['BSIT', 'BSHM', 'BIT-ET', 'BIT-CT', 'BIT-AT', 'BSFI', 'BSIE'];
+    // Programs come from the database (see models/Program.model.js)
+    const programs = await getProgramCodes(true);
+    if (programs.length === 0) {
+      console.error('No active programs found. Run `node seedPrograms.js` first.');
+      process.exit(1);
+    }
+    console.log(`Loaded ${programs.length} programs: ${programs.join(', ')}`);
     
     // Specializations for each program
     const specializationsByProgram = {
@@ -125,6 +131,9 @@ const createFacultyData = async () => {
             }
           ],
           specializations: selectedSpecs,
+          // Each seeded faculty is qualified for the one program they belong to.
+          // Without this, program-filtered faculty lists come back empty.
+          programs: [program],
           maxTeachingLoad: maxLoad,
           currentLoad: 0,
           isActive: true

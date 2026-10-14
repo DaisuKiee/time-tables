@@ -12,6 +12,7 @@ exports.getAllFaculty = async (req, res) => {
       isActive, 
       search, 
       specialization,
+      program,
       minLoad,
       maxLoad 
     } = req.query;
@@ -29,6 +30,15 @@ exports.getAllFaculty = async (req, res) => {
 
     if (specialization) {
       query.specializations = { $in: [specialization] };
+    }
+
+    // Filter by program: only faculty who can teach in this program, meaning
+    // they are either qualified for it or have taught it before.
+    if (program) {
+      query.$or = [
+        { programs: program },
+        { 'teachingHistory.program': program },
+      ];
     }
 
     // Load filtering
@@ -206,6 +216,9 @@ exports.updateFaculty = async (req, res) => {
       position,
       qualifications,
       specializations,
+      programs,
+      experiencedSubjects,
+      maxTeachingHours,
       maxTeachingLoad,
       preferredTimeSlots,
       unavailableTimeSlots,
@@ -220,6 +233,17 @@ exports.updateFaculty = async (req, res) => {
         success: false,
         message: 'Faculty member not found'
       });
+    }
+
+    // If user is faculty role, they can only update their own profile
+    if (req.user.role === 'faculty') {
+      const userFacultyId = req.user.facultyProfile?._id || req.user.facultyProfile;
+      if (userFacultyId.toString() !== req.params.id) {
+        return res.status(403).json({
+          success: false,
+          message: 'You can only update your own profile'
+        });
+      }
     }
 
     // Check if new employee ID conflicts
@@ -239,6 +263,9 @@ exports.updateFaculty = async (req, res) => {
     if (position) faculty.position = position;
     if (qualifications) faculty.qualifications = qualifications;
     if (specializations) faculty.specializations = specializations;
+    if (programs) faculty.programs = programs;
+    if (experiencedSubjects) faculty.experiencedSubjects = experiencedSubjects;
+    if (maxTeachingHours !== undefined) faculty.maxTeachingHours = maxTeachingHours;
     if (maxTeachingLoad !== undefined) faculty.maxTeachingLoad = maxTeachingLoad;
     if (preferredTimeSlots) faculty.preferredTimeSlots = preferredTimeSlots;
     if (unavailableTimeSlots) faculty.unavailableTimeSlots = unavailableTimeSlots;
@@ -488,10 +515,23 @@ exports.getFacultyBySpecialization = async (req, res) => {
 // @access  Private
 exports.getAvailableFaculty = async (req, res) => {
   try {
-    const faculty = await Faculty.find({
+    const { program } = req.query;
+
+    const query = {
       isActive: true,
       $expr: { $lt: ['$currentLoad', '$maxTeachingLoad'] }
-    })
+    };
+
+    // Restrict to faculty qualified for (or previously teaching) this program.
+    // For program managers this is injected by checkProgramAccess.
+    if (program) {
+      query.$or = [
+        { programs: program },
+        { 'teachingHistory.program': program },
+      ];
+    }
+
+    const faculty = await Faculty.find(query)
     .populate('user', 'firstName lastName middleName email')
     .sort({ currentLoad: 1 });
 

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
 import Layout from '../components/Layout';
+import MyClassesEnrollment from '../components/MyClassesEnrollment';
 import { 
   Users, BookOpen, DoorOpen, Calendar, 
   TrendingUp, Clock, CheckCircle, AlertTriangle,
@@ -35,6 +36,8 @@ const DashboardPage = () => {
   const [currentTime, setCurrentTime] = useState(new Date());
   const [selectedPeriod, setSelectedPeriod] = useState('month'); // 'month' or 'quarter'
   const [pageReady, setPageReady] = useState(false);
+  const [conflicts, setConflicts] = useState(null);
+  const [loadingConflicts, setLoadingConflicts] = useState(false);
 
   // Page entrance zoom animation
   useEffect(() => {
@@ -44,11 +47,21 @@ const DashboardPage = () => {
     return () => clearTimeout(timer);
   }, []);
 
+  // These aggregate stats are only rendered for staff. Students and faculty have
+  // their own dashboard sections, so firing the staff endpoints for them just
+  // produced a row of 403s on every dashboard load.
+  const STAFF_ROLES = ['admin', 'scheduling_officer', 'program_manager'];
+  const canSeeStats = STAFF_ROLES.includes(user?.role);
+
   useEffect(() => {
-    loadDashboardStats();
+    if (canSeeStats) {
+      loadDashboardStats();
+    } else {
+      setLoading(false);
+    }
     const timer = setInterval(() => setCurrentTime(new Date()), 60000); // Update every minute
     return () => clearInterval(timer);
-  }, []);
+  }, [canSeeStats]);
 
   const loadDashboardStats = async () => {
     try {
@@ -68,9 +81,19 @@ const DashboardPage = () => {
       const studentData = studentRes.data.data || [];
       const subjectData = subjectRes.data.data || [];
 
-      // Calculate year level distribution
+      // Calculate year level distribution from sectionCode
       const yearDistribution = studentData.reduce((acc, student) => {
-        const year = student.yearLevel || 'Unknown';
+        let year = 'Unknown';
+        
+        // Extract year from sectionCode
+        // Formats: "BSIT-4A", "BSIT-4A-D", "BSIT-3B-N", etc.
+        if (student.sectionCode) {
+          const match = student.sectionCode.match(/-(\d+)[A-Z]/);
+          if (match) {
+            year = match[1]; // Extract the year number
+          }
+        }
+        
         acc[year] = (acc[year] || 0) + 1;
         return acc;
       }, {});
@@ -97,7 +120,10 @@ const DashboardPage = () => {
         programStudents: studentData.length,
         programSubjects: subjectData.length,
         programSchedules: scheduleData.length,
-        programByYear: Object.entries(yearDistribution).map(([year, count]) => ({ year, count })),
+        programByYear: Object.entries(yearDistribution)
+          .filter(([year]) => year !== 'Unknown') // Filter out unknown years
+          .map(([year, count]) => ({ year, count }))
+          .sort((a, b) => parseInt(a.year) - parseInt(b.year)), // Sort by year
         programBySemester: Object.entries(semesterDistribution).map(([semester, count]) => ({ semester, count }))
       });
     } catch (error) {
@@ -107,6 +133,27 @@ const DashboardPage = () => {
       setLoading(false);
     }
   };
+
+  const loadConflicts = async () => {
+    if (user?.role !== 'admin' && user?.role !== 'scheduling_officer') return;
+    
+    try {
+      setLoadingConflicts(true);
+      const response = await scheduleAPI.getConflicts(true); // Get summary
+      setConflicts(response.data.data);
+    } catch (error) {
+      console.error('Failed to load conflicts:', error);
+    } finally {
+      setLoadingConflicts(false);
+    }
+  };
+
+  // Load conflicts for admin/scheduling officer
+  useEffect(() => {
+    if (user?.role === 'admin' || user?.role === 'scheduling_officer') {
+      loadConflicts();
+    }
+  }, [user?.role]);
 
   const formatDate = () => {
     return currentTime.toLocaleDateString('en-US', { 
@@ -125,28 +172,31 @@ const DashboardPage = () => {
     });
   };
 
-  const ModernStatCard = ({ icon: Icon, label, value, sublabel, iconColor, iconBg }) => (
-    <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6 hover:shadow-md transition-shadow dark:bg-gray-800 dark:border-gray-700">
-      <div className="flex items-start justify-between">
-        <div className="flex-1">
-          <p className="text-sm font-medium text-gray-600 mb-1 dark:text-gray-400">{label}</p>
-          <div className="text-3xl font-bold text-gray-900 dark:text-gray-100">
-            {loading ? (
-              <div className="animate-pulse h-9 w-20 bg-gray-200 rounded dark:bg-gray-700"></div>
-            ) : (
-              value
-            )}
-          </div>
-          {sublabel && (
-            <p className="text-xs text-gray-500 mt-2 dark:text-gray-400">{sublabel}</p>
-          )}
-        </div>
-        <div className={`p-3 rounded-xl ${iconBg}`}>
-          <Icon className={`w-6 h-6 ${iconColor}`} />
-        </div>
-      </div>
+const ModernStatCard = ({ icon: Icon, label, value, sublabel }) => (
+  <div className="rounded-2xl border border-blue-200 bg-white p-6 shadow-sm transition-shadow hover:shadow-md dark:border-blue-700 dark:bg-gray-800">
+    <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-xl bg-white dark:bg-gray-700">
+      <Icon className="h-6 w-6 text-black dark:text-white" />
     </div>
-  );
+ 
+    <div className="text-4xl font-extrabold text-black dark:text-white">
+      {loading ? (
+        <div className="h-10 w-20 animate-pulse rounded bg-gray-200 dark:bg-gray-700" />
+      ) : (
+        value
+      )}
+    </div>
+ 
+    <p className="mt-2 text-xs font-semibold uppercase tracking-wider text-black dark:text-gray-300">
+      {label}
+    </p>
+ 
+    {sublabel && (
+      <span className="mt-4 inline-block rounded-full bg-yellow-100 px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-blue-700 dark:bg-yellow-500/20 dark:text-yellow-300">
+        {sublabel}
+      </span>
+    )}
+  </div>
+);
 
   return (
     <Layout>
@@ -165,50 +215,143 @@ const DashboardPage = () => {
       <div className={`relative z-10 transition-all duration-700 ease-out ${
         pageReady ? 'opacity-100 scale-100' : 'opacity-0 scale-95'
       }`}>
-      {/* Header Section */}
-      <div className="mb-8">
-        <div className="flex items-center justify-between mb-6">
-          <div>
-            <h1 className="text-3xl font-bold text-gray-900 mb-2 dark:text-gray-100">
-              Good day, {user?.role === 'admin' ? 'System Administrator' : user?.firstName}
-            </h1>
-            <p className="text-sm text-gray-500 dark:text-gray-400">
-              Real-time overview • CTU Daanbantayan Campus • {formatDate()}
-            </p>
-          </div>
-          <div className="flex items-center gap-3">
+      {/* Header Section - Only for staff roles (admin, scheduling_officer, program_manager) */}
+      {canSeeStats && (
+     <div className="mb-6 rounded-3xl bg-blue-900 px-8 py-7 text-white shadow-xl ring-1 ring-white/5">
+  <div className="flex flex-wrap items-center justify-between gap-4">
+    <div className="min-w-0">
+      <span className="inline-flex items-center gap-2 rounded-full border border-yellow-400/50 bg-yellow-400/20 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-yellow-100">
+        <GraduationCap size={14} />
+        CTU Daanbantayan Campus
+      </span>
+      <h1 className="mt-3 text-3xl font-bold">
+        Good day, {user?.role === 'admin' ? 'System Administrator' : user?.firstName}
+      </h1>
+      <p className="mt-2 text-sm text-blue-200">
+        Real-time overview • {formatDate()}
+      </p>
+    </div>
+ 
+    <div className="flex items-center gap-3">
+            {/* Refresh and the period toggle only drive the staff stats */}
+            {canSeeStats && (
+        <>
+          <button
+            onClick={() => setSelectedPeriod(selectedPeriod === 'month' ? 'quarter' : 'month')}
+            className={`rounded-xl px-4 py-2 text-sm font-semibold transition-colors ${
+              selectedPeriod === 'month'
+                ? 'bg-yellow-400 text-blue-900 shadow-lg shadow-yellow-400/30'
+                : 'border border-white/10 bg-white/5 text-blue-100 hover:bg-white/10'
+            }`}
+          >
+            This Month
+          </button>
+          <button
+            onClick={() => setSelectedPeriod(selectedPeriod === 'quarter' ? 'month' : 'quarter')}
+            className={`rounded-xl px-4 py-2 text-sm font-semibold transition-colors ${
+              selectedPeriod === 'quarter'
+                ? 'bg-yellow-400 text-blue-900 shadow-lg shadow-yellow-400/30'
+                : 'border border-white/10 bg-white/5 text-blue-100 hover:bg-white/10'
+            }`}
+          >
+            This Quarter
+          </button>
+ 
+          {/* Live clock (uses your existing currentTime / formatTime) + Refresh */}
+          <div className="flex items-center gap-3 rounded-xl border border-white/10 bg-white/5 py-1.5 pl-4 pr-1.5">
+            <span className="flex items-center gap-2 text-xs">
+              <span className="h-2 w-2 rounded-full bg-yellow-400" />
+              <span className="font-bold text-yellow-400">LIVE</span>
+              <span className="text-blue-200">{formatTime()}</span>
+            </span>
             <button
               onClick={loadDashboardStats}
               disabled={loading}
-              className="flex items-center gap-2 px-4 py-2 text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors disabled:opacity-50 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-600 dark:hover:bg-gray-700"
+              className="inline-flex items-center gap-2 rounded-lg bg-yellow-400/30 px-3 py-2 text-sm font-semibold transition-colors hover:bg-yellow-400/50 disabled:opacity-50"
             >
-              <RefreshCw size={18} className={loading ? 'animate-spin' : ''} />
+              <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
               Refresh
             </button>
-            <button
-              onClick={() => setSelectedPeriod(selectedPeriod === 'month' ? 'quarter' : 'month')}
-              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-                selectedPeriod === 'month'
-                  ? 'bg-yellow-400 text-gray-900'
-                  : 'bg-white text-gray-700 border border-gray-300 hover:bg-gray-50 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-600 dark:hover:bg-gray-700'
-              }`}
-            >
-              This Month
-            </button>
-            <button
-              onClick={() => setSelectedPeriod(selectedPeriod === 'quarter' ? 'month' : 'quarter')}
-              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-                selectedPeriod === 'quarter'
-                  ? 'bg-yellow-400 text-gray-900'
-                  : 'bg-white text-gray-700 border border-gray-300 hover:bg-gray-50 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-600 dark:hover:bg-gray-700'
-              }`}
-            >
-              This Quarter
-            </button>
+          </div>
+        </>
+      )}
+    </div>
+  </div>
+</div>
+      )}
+
+      {/* Schedule Conflict Warning Banner */}
+      {(user?.role === 'admin' || user?.role === 'scheduling_officer') && conflicts?.hasConflicts && (
+        <div className="mb-6 bg-gradient-to-r from-red-50 to-orange-50 dark:from-red-900/20 dark:to-orange-900/20 border-2 border-red-500 dark:border-red-600 rounded-xl p-6 shadow-lg animate-pulse">
+          <div className="flex items-start gap-4">
+            <div className="flex-shrink-0">
+              <div className="w-12 h-12 bg-red-500 rounded-full flex items-center justify-center animate-bounce">
+                <AlertTriangle className="w-7 h-7 text-white" />
+              </div>
+            </div>
+            <div className="flex-1">
+              <h3 className="text-xl font-bold text-red-900 dark:text-red-100 mb-2 flex items-center gap-2">
+                <span className="inline-block w-3 h-3 bg-red-500 rounded-full animate-ping"></span>
+                Schedule Conflicts Detected - Immediate Action Required!
+              </h3>
+              <p className="text-red-800 dark:text-red-200 mb-4">
+                There {conflicts.totalConflicts === 1 ? 'is' : 'are'} <span className="font-bold text-2xl">{conflicts.totalConflicts}</span> scheduling conflict{conflicts.totalConflicts !== 1 ? 's' : ''} that need to be resolved immediately.
+                {conflicts.highSeverity > 0 && (
+                  <span className="ml-2 px-2 py-1 bg-red-600 text-white text-xs font-bold rounded">
+                    {conflicts.highSeverity} HIGH PRIORITY
+                  </span>
+                )}
+              </p>
+              
+              {/* Critical Conflicts Preview */}
+              {conflicts.criticalConflicts && conflicts.criticalConflicts.length > 0 && (
+                <div className="space-y-2 mb-4">
+                  {conflicts.criticalConflicts.slice(0, 3).map((conflict, index) => (
+                    <div key={index} className="bg-white dark:bg-gray-800 border border-red-300 dark:border-red-700 rounded-lg p-3">
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="px-2 py-0.5 bg-red-600 text-white text-xs font-bold rounded">
+                          {conflict.type.replace(/_/g, ' ')}
+                        </span>
+                        <span className="text-sm font-semibold text-gray-900 dark:text-white">
+                          {conflict.day} • {conflict.timeRange}
+                        </span>
+                      </div>
+                      <p className="text-sm text-gray-700 dark:text-gray-300">
+                        {conflict.type === 'FACULTY_DOUBLE_BOOKING' && (
+                          <>Faculty <span className="font-semibold">{conflict.faculty?.name}</span> is assigned to multiple classes</>
+                        )}
+                        {conflict.type === 'ROOM_DOUBLE_BOOKING' && (
+                          <>Room <span className="font-semibold">{conflict.room}</span> is double-booked</>
+                        )}
+                        {conflict.type === 'SECTION_DOUBLE_BOOKING' && (
+                          <>Section <span className="font-semibold">{conflict.section}</span> has overlapping classes</>
+                        )}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => window.location.href = '/schedules'}
+                  className="px-6 py-3 bg-red-600 hover:bg-red-700 text-white font-bold rounded-lg shadow-lg hover:shadow-xl transition-all flex items-center gap-2"
+                >
+                  <AlertTriangle className="w-5 h-5" />
+                  View & Fix Conflicts Now
+                </button>
+                <button
+                  onClick={loadConflicts}
+                  disabled={loadingConflicts}
+                  className="px-4 py-3 bg-white dark:bg-gray-700 border-2 border-red-500 dark:border-red-600 text-red-700 dark:text-red-300 font-semibold rounded-lg hover:bg-red-50 dark:hover:bg-gray-600 transition-all disabled:opacity-50"
+                >
+                  {loadingConflicts ? 'Checking...' : 'Refresh Check'}
+                </button>
+              </div>
+            </div>
           </div>
         </div>
-
-      </div>
+      )}
 
       {/* Admin/Scheduler Dashboard */}
       {(user?.role === 'admin' || user?.role === 'scheduling_officer') && (
@@ -320,103 +463,6 @@ const DashboardPage = () => {
               iconBg="bg-red-50"
             />
           </div>
-
-          {/* Quick Actions & Recent Activity */}
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            {/* Quick Actions */}
-            <div className="lg:col-span-2 bg-white rounded-xl shadow-sm border border-gray-100 p-6 dark:bg-gray-800 dark:border-gray-700">
-              <h2 className="text-lg font-semibold text-gray-900 mb-4 dark:text-gray-100">Quick Actions</h2>
-              <div className="grid grid-cols-2 gap-4">
-                <button
-                  onClick={() => window.location.href = '/faculty'}
-                  className="flex items-center gap-3 p-4 bg-gradient-to-br from-blue-50 to-blue-100 rounded-lg hover:from-blue-100 hover:to-blue-200 transition-all group dark:from-blue-900 dark:to-blue-800 dark:hover:from-blue-800 dark:hover:to-blue-700"
-                >
-                  <div className="p-2 bg-blue-500 rounded-lg group-hover:scale-110 transition-transform">
-                    <Users className="w-5 h-5 text-white" />
-                  </div>
-                  <div className="text-left">
-                    <p className="font-medium text-gray-900 text-sm dark:text-gray-100">Manage Faculty</p>
-                    <p className="text-xs text-gray-600 dark:text-gray-400">View all faculty</p>
-                  </div>
-                </button>
-
-                <button
-                  onClick={() => window.location.href = '/schedules'}
-                  className="flex items-center gap-3 p-4 bg-gradient-to-br from-green-50 to-green-100 rounded-lg hover:from-green-100 hover:to-green-200 transition-all group dark:from-green-900 dark:to-green-800 dark:hover:from-green-800 dark:hover:to-green-700"
-                >
-                  <div className="p-2 bg-green-500 rounded-lg group-hover:scale-110 transition-transform">
-                    <Calendar className="w-5 h-5 text-white" />
-                  </div>
-                  <div className="text-left">
-                    <p className="font-medium text-gray-900 text-sm dark:text-gray-100">Schedules</p>
-                    <p className="text-xs text-gray-600 dark:text-gray-400">Generate & assign</p>
-                  </div>
-                </button>
-
-                <button
-                  onClick={() => window.location.href = '/subjects'}
-                  className="flex items-center gap-3 p-4 bg-gradient-to-br from-purple-50 to-purple-100 rounded-lg hover:from-purple-100 hover:to-purple-200 transition-all group dark:from-purple-900 dark:to-purple-800 dark:hover:from-purple-800 dark:hover:to-purple-700"
-                >
-                  <div className="p-2 bg-purple-500 rounded-lg group-hover:scale-110 transition-transform">
-                    <BookOpen className="w-5 h-5 text-white" />
-                  </div>
-                  <div className="text-left">
-                    <p className="font-medium text-gray-900 text-sm dark:text-gray-100">Subjects</p>
-                    <p className="text-xs text-gray-600 dark:text-gray-400">Manage curriculum</p>
-                  </div>
-                </button>
-
-                <button
-                  onClick={() => window.location.href = '/rooms'}
-                  className="flex items-center gap-3 p-4 bg-gradient-to-br from-orange-50 to-orange-100 rounded-lg hover:from-orange-100 hover:to-orange-200 transition-all group dark:from-orange-900 dark:to-orange-800 dark:hover:from-orange-800 dark:hover:to-orange-700"
-                >
-                  <div className="p-2 bg-orange-500 rounded-lg group-hover:scale-110 transition-transform">
-                    <DoorOpen className="w-5 h-5 text-white" />
-                  </div>
-                  <div className="text-left">
-                    <p className="font-medium text-gray-900 text-sm dark:text-gray-100">Rooms</p>
-                    <p className="text-xs text-gray-600 dark:text-gray-400">Manage facilities</p>
-                  </div>
-                </button>
-              </div>
-            </div>
-
-            {/* Recent Activity */}
-            <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6 dark:bg-gray-800 dark:border-gray-700">
-              <h2 className="text-lg font-semibold text-gray-900 mb-4 dark:text-gray-100">System Status</h2>
-              <div className="space-y-4">
-                <div className="flex items-start gap-3">
-                  <div className="p-2 bg-green-100 rounded-lg dark:bg-green-900">
-                    <CheckCircle className="w-4 h-4 text-green-600 dark:text-green-400" />
-                  </div>
-                  <div className="flex-1">
-                    <p className="text-sm font-medium text-gray-900 dark:text-gray-100">All Systems Online</p>
-                    <p className="text-xs text-gray-500 dark:text-gray-400">Last checked: {formatTime()}</p>
-                  </div>
-                </div>
-
-                <div className="flex items-start gap-3">
-                  <div className="p-2 bg-blue-100 rounded-lg dark:bg-blue-900">
-                    <Clock className="w-4 h-4 text-blue-600 dark:text-blue-400" />
-                  </div>
-                  <div className="flex-1">
-                    <p className="text-sm font-medium text-gray-900 dark:text-gray-100">Ready for Operations</p>
-                    <p className="text-xs text-gray-500 dark:text-gray-400">AI scheduling available</p>
-                  </div>
-                </div>
-
-                <div className="flex items-start gap-3">
-                  <div className="p-2 bg-orange-100 rounded-lg dark:bg-orange-900">
-                    <Info className="w-4 h-4 text-orange-600 dark:text-orange-400" />
-                  </div>
-                  <div className="flex-1">
-                    <p className="text-sm font-medium text-gray-900 dark:text-gray-100">Data Entry Needed</p>
-                    <p className="text-xs text-gray-500 dark:text-gray-400">Complete faculty profiles</p>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
         </>
       )}
 
@@ -459,268 +505,50 @@ const DashboardPage = () => {
             />
           </div>
 
-          {/* Row 2: Distribution Analytics */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
-            {/* Students by Year Level */}
-            <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6 dark:bg-gray-800 dark:border-gray-700">
-              <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center gap-2 dark:text-gray-100">
-                <TrendingUp className="w-5 h-5 text-blue-600 dark:text-blue-400" />
-                Students by Year Level
-              </h3>
-              {loading ? (
-                <div className="space-y-3">
-                  {[1, 2, 3, 4].map(i => (
-                    <div key={i} className="animate-pulse h-12 bg-gray-200 rounded dark:bg-gray-700"></div>
-                  ))}
-                </div>
-              ) : stats.programByYear.length > 0 ? (
-                <div className="space-y-3">
-                  {stats.programByYear
-                    .sort((a, b) => parseInt(a.year) - parseInt(b.year))
-                    .map((item) => {
-                      const percentage = stats.programStudents > 0 
-                        ? (item.count / stats.programStudents * 100).toFixed(1)
-                        : 0;
-                      return (
-                        <div key={item.year} className="flex items-center gap-3">
-                          <div className="w-20 text-sm font-medium text-gray-700 dark:text-gray-300">
-                            Year {item.year}
-                          </div>
-                          <div className="flex-1 bg-gray-100 rounded-full h-8 relative overflow-hidden dark:bg-gray-700">
-                            <div
-                              className="h-full bg-gradient-to-r from-blue-500 to-blue-600 rounded-full flex items-center justify-end px-3 transition-all duration-500"
-                              style={{ width: `${percentage}%` }}
-                            >
-                              {percentage > 15 && (
-                                <span className="text-xs font-semibold text-white">
-                                  {item.count}
-                                </span>
-                              )}
-                            </div>
-                          </div>
-                          <div className="w-16 text-right">
-                            <span className="text-sm font-semibold text-gray-900 dark:text-gray-100">{item.count}</span>
-                            <span className="text-xs text-gray-500 ml-1 dark:text-gray-400">({percentage}%)</span>
-                          </div>
-                        </div>
-                      );
-                    })}
-                </div>
-              ) : (
-                <div className="text-center py-8 text-gray-500 dark:text-gray-400">
-                  <Users className="w-12 h-12 mx-auto mb-2 text-gray-300 dark:text-gray-600" />
-                  <p>No student data available</p>
-                </div>
-              )}
-            </div>
-
-            {/* Students by Semester */}
-            <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6 dark:bg-gray-800 dark:border-gray-700">
-              <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center gap-2 dark:text-gray-100">
-                <Clock className="w-5 h-5 text-purple-600 dark:text-purple-400" />
-                Students by Semester
-              </h3>
-              {loading ? (
-                <div className="space-y-3">
-                  {[1, 2].map(i => (
-                    <div key={i} className="animate-pulse h-12 bg-gray-200 rounded dark:bg-gray-700"></div>
-                  ))}
-                </div>
-              ) : stats.programBySemester.length > 0 ? (
-                <div className="space-y-3">
-                  {stats.programBySemester
-                    .sort((a, b) => parseInt(a.semester) - parseInt(b.semester))
-                    .map((item) => {
-                      const percentage = stats.programStudents > 0
-                        ? (item.count / stats.programStudents * 100).toFixed(1)
-                        : 0;
-                      const semesterName = item.semester === '1' ? '1st Semester' : '2nd Semester';
-                      return (
-                        <div key={item.semester} className="flex items-center gap-3">
-                          <div className="w-28 text-sm font-medium text-gray-700 dark:text-gray-300">
-                            {semesterName}
-                          </div>
-                          <div className="flex-1 bg-gray-100 rounded-full h-8 relative overflow-hidden dark:bg-gray-700">
-                            <div
-                              className="h-full bg-gradient-to-r from-purple-500 to-purple-600 rounded-full flex items-center justify-end px-3 transition-all duration-500"
-                              style={{ width: `${percentage}%` }}
-                            >
-                              {percentage > 15 && (
-                                <span className="text-xs font-semibold text-white">
-                                  {item.count}
-                                </span>
-                              )}
-                            </div>
-                          </div>
-                          <div className="w-16 text-right">
-                            <span className="text-sm font-semibold text-gray-900 dark:text-gray-100">{item.count}</span>
-                            <span className="text-xs text-gray-500 ml-1 dark:text-gray-400">({percentage}%)</span>
-                          </div>
-                        </div>
-                      );
-                    })}
-                </div>
-              ) : (
-                <div className="text-center py-8 text-gray-500 dark:text-gray-400">
-                  <Clock className="w-12 h-12 mx-auto mb-2 text-gray-300 dark:text-gray-600" />
-                  <p>No semester data available</p>
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* Quick Actions for Program Manager */}
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
-            <div className="lg:col-span-2 bg-white rounded-xl shadow-sm border border-gray-100 p-6 dark:bg-gray-800 dark:border-gray-700">
-              <h2 className="text-lg font-semibold text-gray-900 mb-4 dark:text-gray-100">Quick Actions</h2>
-              <div className="grid grid-cols-2 gap-4">
-                <button
-                  onClick={() => window.location.href = '/students'}
-                  className="flex items-center gap-3 p-4 bg-gradient-to-br from-blue-50 to-blue-100 rounded-lg hover:from-blue-100 hover:to-blue-200 transition-all group dark:from-blue-900 dark:to-blue-800 dark:hover:from-blue-800 dark:hover:to-blue-700"
-                >
-                  <div className="p-2 bg-blue-500 rounded-lg group-hover:scale-110 transition-transform">
-                    <Users className="w-5 h-5 text-white" />
-                  </div>
-                  <div className="text-left">
-                    <p className="font-medium text-gray-900 text-sm dark:text-gray-100">Manage Students</p>
-                    <p className="text-xs text-gray-600 dark:text-gray-400">{stats.programStudents} students</p>
-                  </div>
-                </button>
-
-                <button
-                  onClick={() => window.location.href = '/subjects'}
-                  className="flex items-center gap-3 p-4 bg-gradient-to-br from-green-50 to-green-100 rounded-lg hover:from-green-100 hover:to-green-200 transition-all group dark:from-green-900 dark:to-green-800 dark:hover:from-green-800 dark:hover:to-green-700"
-                >
-                  <div className="p-2 bg-green-500 rounded-lg group-hover:scale-110 transition-transform">
-                    <BookOpen className="w-5 h-5 text-white" />
-                  </div>
-                  <div className="text-left">
-                    <p className="font-medium text-gray-900 text-sm dark:text-gray-100">Program Subjects</p>
-                    <p className="text-xs text-gray-600 dark:text-gray-400">{stats.programSubjects} subjects</p>
-                  </div>
-                </button>
-
-                <button
-                  onClick={() => window.location.href = '/schedules'}
-                  className="flex items-center gap-3 p-4 bg-gradient-to-br from-purple-50 to-purple-100 rounded-lg hover:from-purple-100 hover:to-purple-200 transition-all group dark:from-purple-900 dark:to-purple-800 dark:hover:from-purple-800 dark:hover:to-purple-700"
-                >
-                  <div className="p-2 bg-purple-500 rounded-lg group-hover:scale-110 transition-transform">
-                    <Calendar className="w-5 h-5 text-white" />
-                  </div>
-                  <div className="text-left">
-                    <p className="font-medium text-gray-900 text-sm dark:text-gray-100">Schedules</p>
-                    <p className="text-xs text-gray-600 dark:text-gray-400">{stats.programSchedules} schedules</p>
-                  </div>
-                </button>
-
-                <button
-                  onClick={() => window.location.href = '/rooms'}
-                  className="flex items-center gap-3 p-4 bg-gradient-to-br from-orange-50 to-orange-100 rounded-lg hover:from-orange-100 hover:to-orange-200 transition-all group dark:from-orange-900 dark:to-orange-800 dark:hover:from-orange-800 dark:hover:to-orange-700"
-                >
-                  <div className="p-2 bg-orange-500 rounded-lg group-hover:scale-110 transition-transform">
-                    <DoorOpen className="w-5 h-5 text-white" />
-                  </div>
-                  <div className="text-left">
-                    <p className="font-medium text-gray-900 text-sm dark:text-gray-100">Rooms</p>
-                    <p className="text-xs text-gray-600 dark:text-gray-400">Available facilities</p>
-                  </div>
-                </button>
-              </div>
-            </div>
-
-            {/* Program Status */}
-            <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6 dark:bg-gray-800 dark:border-gray-700">
-              <h2 className="text-lg font-semibold text-gray-900 mb-4 dark:text-gray-100">Program Status</h2>
-              <div className="space-y-4">
-                <div className="flex items-start gap-3">
-                  <div className="p-2 bg-green-100 rounded-lg dark:bg-green-900">
-                    <CheckCircle className="w-4 h-4 text-green-600 dark:text-green-400" />
-                  </div>
-                  <div className="flex-1">
-                    <p className="text-sm font-medium text-gray-900 dark:text-gray-100">Program Active</p>
-                    <p className="text-xs text-gray-500 dark:text-gray-400">{user?.program} operations normal</p>
-                  </div>
-                </div>
-
-                <div className="flex items-start gap-3">
-                  <div className="p-2 bg-blue-100 rounded-lg dark:bg-blue-900">
-                    <Users className="w-4 h-4 text-blue-600 dark:text-blue-400" />
-                  </div>
-                  <div className="flex-1">
-                    <p className="text-sm font-medium text-gray-900 dark:text-gray-100">{stats.programStudents} Enrolled</p>
-                    <p className="text-xs text-gray-500 dark:text-gray-400">Active this semester</p>
-                  </div>
-                </div>
-
-                <div className="flex items-start gap-3">
-                  <div className="p-2 bg-purple-100 rounded-lg dark:bg-purple-900">
-                    <Calendar className="w-4 h-4 text-purple-600 dark:text-purple-400" />
-                  </div>
-                  <div className="flex-1">
-                    <p className="text-sm font-medium text-gray-900 dark:text-gray-100">Schedule Ready</p>
-                    <p className="text-xs text-gray-500 dark:text-gray-400">{stats.programSchedules} schedules created</p>
-                  </div>
-                </div>
-
-                {stats.programStudents === 0 && (
-                  <div className="flex items-start gap-3">
-                    <div className="p-2 bg-orange-100 rounded-lg dark:bg-orange-900">
-                      <AlertTriangle className="w-4 h-4 text-orange-600 dark:text-orange-400" />
-                    </div>
-                    <div className="flex-1">
-                      <p className="text-sm font-medium text-gray-900 dark:text-gray-100">Add Students</p>
-                      <p className="text-xs text-gray-500 dark:text-gray-400">No students enrolled yet</p>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
-
           {/* Additional Stats Row */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+            <div className="bg-white rounded-xl shadow-sm border border-blue-200 p-6 dark:bg-gray-800 dark:border-blue-700">
               <div className="flex items-center gap-3 mb-3">
-                <div className="p-2 bg-indigo-100 rounded-lg">
-                  <TrendingUp className="w-5 h-5 text-indigo-600" />
+                <div className="p-2 bg-white rounded-lg dark:bg-gray-700">
+                  <TrendingUp className="w-5 h-5 text-black dark:text-white" />
                 </div>
-                <h3 className="font-semibold text-gray-900">Enrollment Trend</h3>
+                <h3 className="font-semibold text-black dark:text-white">Enrollment Trend</h3>
               </div>
-              <p className="text-3xl font-bold text-gray-900 mb-1">{stats.programStudents}</p>
-              <p className="text-sm text-gray-600">Total students enrolled</p>
+              <p className="text-3xl font-bold text-black mb-1 dark:text-white">{stats.programStudents}</p>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Total students enrolled</p>
               <div className="mt-4 flex items-center gap-2 text-xs">
-                <span className="px-2 py-1 bg-green-100 text-green-700 rounded">Active</span>
-                <span className="text-gray-500">Current semester</span>
+                <span className="px-2 py-1 bg-yellow-100 text-blue-700 rounded dark:bg-yellow-500/20 dark:text-yellow-300">Active</span>
+                <span className="text-gray-500 dark:text-gray-400">Current semester</span>
               </div>
             </div>
 
-            <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+            <div className="bg-white rounded-xl shadow-sm border border-blue-200 p-6 dark:bg-gray-800 dark:border-blue-700">
               <div className="flex items-center gap-3 mb-3">
-                <div className="p-2 bg-teal-100 rounded-lg">
-                  <BookOpen className="w-5 h-5 text-teal-600" />
+                <div className="p-2 bg-white rounded-lg dark:bg-gray-700">
+                  <BookOpen className="w-5 h-5 text-black dark:text-white" />
                 </div>
-                <h3 className="font-semibold text-gray-900">Curriculum Load</h3>
+                <h3 className="font-semibold text-black dark:text-white">Curriculum Load</h3>
               </div>
-              <p className="text-3xl font-bold text-gray-900 mb-1">{stats.programSubjects}</p>
-              <p className="text-sm text-gray-600">Subjects in curriculum</p>
+              <p className="text-3xl font-bold text-black mb-1 dark:text-white">{stats.programSubjects}</p>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Subjects in curriculum</p>
               <div className="mt-4 flex items-center gap-2 text-xs">
-                <span className="px-2 py-1 bg-blue-100 text-blue-700 rounded">Updated</span>
-                <span className="text-gray-500">Latest curriculum</span>
+                <span className="px-2 py-1 bg-blue-100 text-blue-700 rounded dark:bg-blue-500/20 dark:text-blue-300">Updated</span>
+                <span className="text-gray-500 dark:text-gray-400">Latest curriculum</span>
               </div>
             </div>
 
-            <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+            <div className="bg-white rounded-xl shadow-sm border border-blue-200 p-6 dark:bg-gray-800 dark:border-blue-700">
               <div className="flex items-center gap-3 mb-3">
-                <div className="p-2 bg-rose-100 rounded-lg">
-                  <Calendar className="w-5 h-5 text-rose-600" />
+                <div className="p-2 bg-white rounded-lg dark:bg-gray-700">
+                  <Calendar className="w-5 h-5 text-black dark:text-white" />
                 </div>
-                <h3 className="font-semibold text-gray-900">Schedule Status</h3>
+                <h3 className="font-semibold text-black dark:text-white">Schedule Status</h3>
               </div>
-              <p className="text-3xl font-bold text-gray-900 mb-1">{stats.publishedSchedules}</p>
-              <p className="text-sm text-gray-600">Published schedules</p>
+              <p className="text-3xl font-bold text-black mb-1 dark:text-white">{stats.publishedSchedules}</p>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Published schedules</p>
               <div className="mt-4 flex items-center gap-2 text-xs">
-                <span className="px-2 py-1 bg-purple-100 text-purple-700 rounded">Live</span>
-                <span className="text-gray-500">of {stats.programSchedules} total</span>
+                <span className="px-2 py-1 bg-yellow-100 text-blue-700 rounded dark:bg-yellow-500/20 dark:text-yellow-300">Live</span>
+                <span className="text-gray-500 dark:text-gray-400">of {stats.programSchedules} total</span>
               </div>
             </div>
           </div>
@@ -729,96 +557,104 @@ const DashboardPage = () => {
 
       {/* Faculty Dashboard */}
       {user?.role === 'faculty' && (
-        <div className="space-y-6">
-          <div className="bg-white rounded-lg shadow p-6">
-            <h2 className="text-xl font-semibold text-gray-900 mb-4">My Teaching Schedule</h2>
-            <p className="text-gray-600">Your schedule will appear here once classes are assigned.</p>
-          </div>
-          
-          <div className="bg-white rounded-lg shadow p-6">
-            <h2 className="text-xl font-semibold text-gray-900 mb-4">My Classes</h2>
-            <p className="text-gray-600">View and manage your class spaces.</p>
-            <button
-              onClick={() => window.location.href = '/classes'}
-              className="mt-4 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
-            >
-              View My Classes
-            </button>
-          </div>
-        </div>
+        <FacultyDashboard user={user} loading={loading} />
       )}
 
-      {/* Student Dashboard */}
+      {/* Student Dashboard.
+          This used to be two hardcoded placeholder cards ("Your enrolled classes
+          will appear here"), while the real StudentDashboard component below was
+          defined but never rendered. */}
       {user?.role === 'student' && (
-        <div className="space-y-6">
-          <div className="bg-white rounded-lg shadow p-6">
-            <h2 className="text-xl font-semibold text-gray-900 mb-4">My Enrolled Classes</h2>
-            <p className="text-gray-600">Your enrolled classes will appear here.</p>
-            <button
-              onClick={() => window.location.href = '/classes'}
-              className="mt-4 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
-            >
-              View My Classes
-            </button>
-          </div>
-          
-          <div className="bg-white rounded-lg shadow p-6">
-            <h2 className="text-xl font-semibold text-gray-900 mb-4">Class Schedule</h2>
-            <p className="text-gray-600">Your class schedule will appear here.</p>
-          </div>
-        </div>
+        <StudentDashboard user={user} loading={loading} />
       )}
       </div> {/* Close relative div */}
     </Layout>
   );
 };
 
-export default DashboardPage;
-
-
-// Student Dashboard Component
-const StudentDashboard = ({ user, loading: parentLoading }) => {
-  const [studentData, setStudentData] = useState(null);
+// Faculty Dashboard Component
+const FacultyDashboard = ({ user, loading: parentLoading }) => {
+  const [facultyData, setFacultyData] = useState(null);
+  const [todaySchedule, setTodaySchedule] = useState([]);
+  const [allSchedules, setAllSchedules] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [schedules, setSchedules] = useState([]);
+  const [classes, setClasses] = useState([]);
 
   useEffect(() => {
-    loadStudentData();
+    loadFacultyData();
   }, []);
 
-  const loadStudentData = async () => {
+  const loadFacultyData = async () => {
     try {
-      // Fetch student record
-      const studentRes = await studentAPI.getAll();
-      const allStudents = studentRes.data.data || [];
-      const myStudentRecord = allStudents.find(s => s.user?._id === user?._id || s.user === user?._id);
+      // Get faculty profile from user data
+      const facultyId = user?.facultyProfile?._id || user?.facultyProfile;
       
-      setStudentData(myStudentRecord);
-
-      // Fetch schedules if student has section or subjects
-      if (myStudentRecord) {
-        const scheduleRes = await scheduleAPI.getAll();
-        const allSchedules = scheduleRes.data.data || [];
-        
-        let mySchedules = [];
-        if (myStudentRecord.studentType === 'regular' && myStudentRecord.sectionCode) {
-          // Regular student: filter by section code
-          mySchedules = allSchedules.filter(s => s.section === myStudentRecord.sectionCode);
-        } else if (myStudentRecord.studentType === 'irregular' && myStudentRecord.subjectCodes?.length > 0) {
-          // Irregular student: filter by subject codes
-          mySchedules = allSchedules.filter(s => 
-            myStudentRecord.subjectCodes.includes(s.subject?.subjectCode || s.subject)
-          );
-        }
-        
-        setSchedules(mySchedules);
+      if (!facultyId) {
+        console.error('No faculty profile found for user');
+        setLoading(false);
+        return;
       }
+
+      // Fetch faculty profile, schedule and classes
+      const [facultyRes, scheduleRes, classesRes] = await Promise.all([
+        facultyAPI.getById(facultyId).catch(() => ({ data: { data: null } })),
+        scheduleAPI.getFacultySchedule(facultyId).catch(() => ({ data: { data: [] } })),
+        classSpaceAPI.getMyClasses().catch(() => ({ data: { data: [] } }))
+      ]);
+
+      const faculty = facultyRes.data.data;
+      const schedules = scheduleRes.data.data || [];
+      
+      // Debug logging
+      console.log('Faculty Data:', faculty);
+      console.log('Schedules Data:', schedules);
+      console.log('Sample schedule room:', schedules[0]?.room);
+      
+      setFacultyData(faculty);
+      setAllSchedules(schedules);
+      setClasses(classesRes.data.data || []);
+
+      // Filter today's schedule
+      const today = new Date();
+      const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+      const todayName = dayNames[today.getDay()];
+
+      const todayClasses = schedules
+        .filter(schedule => {
+          return schedule.timeSlots?.some(slot => slot.day === todayName);
+        })
+        .map(schedule => ({
+          ...schedule,
+          todaySlots: schedule.timeSlots.filter(slot => slot.day === todayName)
+        }))
+        .sort((a, b) => {
+          const timeA = a.todaySlots[0]?.startTime || '00:00';
+          const timeB = b.todaySlots[0]?.startTime || '00:00';
+          return timeA.localeCompare(timeB);
+        });
+
+      setTodaySchedule(todayClasses);
     } catch (error) {
-      console.error('Failed to load student data:', error);
-      toast.error('Failed to load your enrollment information');
+      console.error('Failed to load faculty data:', error);
+      toast.error('Failed to load your teaching schedule');
     } finally {
       setLoading(false);
     }
+  };
+
+  const formatTime = (time) => {
+    if (!time) return '';
+    // Convert 24h to 12h format
+    const [hours, minutes] = time.split(':');
+    const hour = parseInt(hours);
+    const ampm = hour >= 12 ? 'PM' : 'AM';
+    const hour12 = hour % 12 || 12;
+    return `${hour12}:${minutes} ${ampm}`;
+  };
+
+  const getCurrentDay = () => {
+    const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    return days[new Date().getDay()];
   };
 
   if (loading || parentLoading) {
@@ -832,153 +668,583 @@ const StudentDashboard = ({ user, loading: parentLoading }) => {
 
   return (
     <div className="space-y-6">
-      {/* Enrollment Card */}
-      <div className="bg-gradient-to-br from-blue-600 to-blue-700 rounded-xl shadow-lg p-6 text-white">
-        <div className="flex items-start justify-between mb-4">
-          <div>
-            <h2 className="text-2xl font-bold mb-1">Welcome back, {user?.firstName}!</h2>
-            <p className="text-blue-100 text-sm">Student ID: {user?.studentId}</p>
+      {/* Welcome Card */}
+      <div className="bg-gradient-to-br from-blue-600 via-blue-700 to-blue-800 rounded-xl shadow-xl p-6 text-white">
+        <div className="flex items-start gap-5 mb-4">
+          {/* Profile Picture */}
+          <div className="flex-shrink-0">
+            {user?.profilePicture ? (
+              <>
+                <img
+                  src={`${process.env.REACT_APP_API_URL?.replace('/api', '')}${user.profilePicture}`}
+                  alt={`${user.firstName} ${user.lastName}`}
+                  className="w-20 h-20 rounded-full object-cover ring-4 ring-yellow-400/50 shadow-xl"
+                  onError={(e) => {
+                    e.target.style.display = 'none';
+                    e.target.nextElementSibling.style.display = 'flex';
+                  }}
+                />
+                <div 
+                  className="w-20 h-20 bg-yellow-400/20 backdrop-blur-sm rounded-full flex items-center justify-center ring-4 ring-yellow-400/50 shadow-xl"
+                  style={{ display: 'none' }}
+                >
+                  <Users className="w-10 h-10 text-yellow-400" />
+                </div>
+              </>
+            ) : (
+              <div className="w-20 h-20 bg-yellow-400/20 backdrop-blur-sm rounded-full flex items-center justify-center ring-4 ring-yellow-400/50 shadow-xl">
+                <Users className="w-10 h-10 text-yellow-400" />
+              </div>
+            )}
           </div>
-          <div className="p-3 bg-white/20 backdrop-blur-sm rounded-lg">
-            <GraduationCap className="w-8 h-8" />
+
+          {/* Profile Info */}
+          <div className="flex-1 min-w-0">
+            <h2 className="text-2xl font-bold mb-1">Welcome back, {user?.firstName}!</h2>
+            <p className="text-blue-100 text-sm font-medium mb-2">
+              Faculty ID: {facultyData?.employeeId || 'Loading...'}
+            </p>
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="px-3 py-1 bg-yellow-400/20 backdrop-blur-sm rounded-full text-xs font-semibold text-yellow-100">
+                {facultyData?.position || 'Faculty'}
+              </span>
+              {facultyData?.employmentType && (
+                <span className={`px-3 py-1 rounded-full text-xs font-semibold ${
+                  facultyData.employmentType === 'Regular'
+                    ? 'bg-yellow-400 text-blue-900'
+                    : 'bg-white/20 text-white'
+                }`}>
+                  {facultyData.employmentType}
+                </span>
+              )}
+            </div>
           </div>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-6">
-          <div className="bg-white/10 backdrop-blur-sm rounded-lg p-4">
-            <p className="text-blue-100 text-sm mb-1">Program</p>
-            <p className="text-xl font-semibold">{user?.program || studentData?.program || 'Not assigned'}</p>
+          <div className="bg-white/10 backdrop-blur-sm rounded-xl p-5 border border-white/20 hover:bg-white/15 transition-all shadow-lg">
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-indigo-100 text-sm font-semibold">Department</p>
+              <div className="w-8 h-8 bg-white/20 rounded-lg flex items-center justify-center">
+                <BookOpen className="w-4 h-4" />
+              </div>
+            </div>
+            <p className="text-2xl font-bold">{facultyData?.department || 'Loading...'}</p>
           </div>
           
-          <div className="bg-white/10 backdrop-blur-sm rounded-lg p-4">
-            <p className="text-blue-100 text-sm mb-1">Student Type</p>
-            <p className="text-xl font-semibold capitalize">{studentData?.studentType || 'Not assigned'}</p>
+          <div className="bg-white/10 backdrop-blur-sm rounded-xl p-5 border border-white/20 hover:bg-white/15 transition-all shadow-lg">
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-indigo-100 text-sm font-semibold">Total Classes</p>
+              <div className="w-8 h-8 bg-white/20 rounded-lg flex items-center justify-center">
+                <Users className="w-4 h-4" />
+              </div>
+            </div>
+            <p className="text-2xl font-bold">{classes.length}</p>
           </div>
 
-          <div className="bg-white/10 backdrop-blur-sm rounded-lg p-4">
-            <p className="text-blue-100 text-sm mb-1">
-              {studentData?.studentType === 'regular' ? 'Section' : 'Subjects Enrolled'}
-            </p>
-            <p className="text-xl font-semibold">
-              {studentData?.studentType === 'regular' 
-                ? (studentData?.sectionCode || 'Not assigned')
-                : (studentData?.subjectCodes?.length || 0) + ' subjects'
-              }
-            </p>
+          <div className="bg-white/10 backdrop-blur-sm rounded-xl p-5 border border-white/20 hover:bg-white/15 transition-all shadow-lg">
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-indigo-100 text-sm font-semibold">Today's Classes</p>
+              <div className="w-8 h-8 bg-white/20 rounded-lg flex items-center justify-center">
+                <Calendar className="w-4 h-4" />
+              </div>
+            </div>
+            <p className="text-2xl font-bold">{todaySchedule.length}</p>
           </div>
         </div>
       </div>
 
-      {/* Enrollment Details */}
-      <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6 dark:bg-gray-800 dark:border-gray-700">
-        <h3 className="text-lg font-semibold text-gray-900 mb-4 dark:text-gray-100">
-          Enrollment Information
-        </h3>
-        
-        {!studentData ? (
-          <div className="text-center py-8 text-gray-500">
-            <Users className="w-12 h-12 mx-auto mb-2 text-gray-300" />
-            <p>No enrollment record found</p>
-            <p className="text-sm mt-1">Please contact your program manager</p>
-          </div>
-        ) : studentData.studentType === 'regular' && !studentData.sectionCode ? (
-          <div className="text-center py-8 text-orange-600 bg-orange-50 rounded-lg">
-            <AlertTriangle className="w-12 h-12 mx-auto mb-2" />
-            <p className="font-medium">Section Not Assigned</p>
-            <p className="text-sm mt-1">Your program manager will assign you to a section soon</p>
-          </div>
-        ) : studentData.studentType === 'irregular' && (!studentData.subjectCodes || studentData.subjectCodes.length === 0) ? (
-          <div className="text-center py-8 text-orange-600 bg-orange-50 rounded-lg">
-            <AlertTriangle className="w-12 h-12 mx-auto mb-2" />
-            <p className="font-medium">No Subjects Enrolled</p>
-            <p className="text-sm mt-1">Your program manager will assign your subjects soon</p>
-          </div>
-        ) : (
-          <div className="space-y-4">
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <p className="text-sm text-gray-600 dark:text-gray-400">Academic Year</p>
-                <p className="font-medium text-gray-900 dark:text-gray-100">{studentData.academicYear}</p>
-              </div>
-              <div>
-                <p className="text-sm text-gray-600 dark:text-gray-400">Semester</p>
-                <p className="font-medium text-gray-900 dark:text-gray-100">
-                  {studentData.semester === 1 ? '1st Semester' : '2nd Semester'}
-                </p>
-              </div>
+      {/* Today's Schedule */}
+      <div className="bg-gray-50 rounded-xl shadow-sm border border-gray-200 p-6 dark:bg-gray-800 dark:border-gray-700">
+        <div className="flex items-center justify-between mb-6">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-indigo-100 rounded-lg dark:bg-indigo-900">
+              <Calendar className="w-6 h-6 text-indigo-600 dark:text-indigo-400" />
             </div>
-
-            {studentData.studentType === 'irregular' && studentData.subjectCodes?.length > 0 && (
-              <div>
-                <p className="text-sm text-gray-600 mb-2 dark:text-gray-400">Enrolled Subjects:</p>
-                <div className="flex flex-wrap gap-2">
-                  {studentData.subjectCodes.map((code, index) => (
-                    <span
-                      key={index}
-                      className="px-3 py-1 bg-blue-100 text-blue-700 rounded-full text-sm font-medium dark:bg-blue-900 dark:text-blue-300"
-                    >
-                      {code}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            <div className="pt-4 border-t border-gray-200 dark:border-gray-700">
-              <p className="text-sm text-gray-600 dark:text-gray-400">Enrollment Status</p>
-              <span className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm font-medium mt-1 ${
-                studentData.enrollmentStatus === 'enrolled' 
-                  ? 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300'
-                  : 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300'
-              }`}>
-                <CheckCircle className="w-4 h-4" />
-                {studentData.enrollmentStatus}
-              </span>
+            <div>
+              <h3 className="text-xl font-semibold text-gray-900 dark:text-gray-100">
+                Your Schedule for Today
+              </h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">
+                {getCurrentDay()}, {new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}
+              </p>
             </div>
           </div>
-        )}
-      </div>
-
-      {/* Schedule Card */}
-      <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6 dark:bg-gray-800 dark:border-gray-700">
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
-            My Class Schedule
-          </h3>
           <button
-            onClick={() => window.location.href = '/schedules'}
-            className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-sm font-medium"
+            onClick={() => window.location.href = '/my-schedule'}
+            className="px-4 py-2 text-indigo-600 border border-indigo-600 rounded-lg hover:bg-indigo-50 transition-colors text-sm font-medium dark:text-indigo-400 dark:border-indigo-400 dark:hover:bg-indigo-900/20"
           >
             View Full Schedule
           </button>
         </div>
 
-        {schedules.length === 0 ? (
+        {todaySchedule.length === 0 ? (
+          <div className="text-center py-12 text-gray-500">
+            <Calendar className="w-16 h-16 mx-auto mb-3 text-gray-300" />
+            <p className="text-lg font-medium">No classes scheduled for today</p>
+            <p className="text-sm mt-1">Enjoy your free day!</p>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {todaySchedule.map((schedule, index) => (
+              <div
+                key={schedule._id || index}
+                className="bg-white border border-gray-200 rounded-lg p-4 hover:border-indigo-400 hover:shadow-md transition-all dark:bg-gray-800 dark:border-gray-700 dark:hover:border-indigo-400"
+              >
+                <div className="flex items-start justify-between">
+                  <div className="flex-1">
+                    {/* Subject Info */}
+                    <div className="flex items-start gap-3 mb-3">
+                      <div className="p-2 bg-indigo-50 rounded-lg dark:bg-indigo-900/30">
+                        <BookOpen className="w-5 h-5 text-indigo-600 dark:text-indigo-400" />
+                      </div>
+                      <div className="flex-1">
+                        <h4 className="font-semibold text-gray-900 text-lg dark:text-gray-100">
+                          {schedule.subject?.subjectCode || 'N/A'}
+                        </h4>
+                        <p className="text-gray-600 dark:text-gray-400">
+                          {schedule.subject?.subjectName || 'Subject name not available'}
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Schedule Details Grid */}
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mt-4">
+                      {/* Time */}
+                      <div className="flex items-center gap-2">
+                        <Clock className="w-4 h-4 text-gray-400" />
+                        <div>
+                          <p className="text-xs text-gray-500 dark:text-gray-400">Time</p>
+                          <p className="font-medium text-gray-900 dark:text-gray-100">
+                            {schedule.todaySlots.map(slot => 
+                              `${formatTime(slot.startTime)}-${formatTime(slot.endTime)}`
+                            ).join(', ')}
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Room */}
+                      <div className="flex items-center gap-2">
+                        <DoorOpen className="w-4 h-4 text-gray-400" />
+                        <div>
+                          <p className="text-xs text-gray-500 dark:text-gray-400">Room</p>
+                          <p className="font-medium text-gray-900 dark:text-gray-100">
+                            {schedule.roomData?.roomName || schedule.roomData?.roomCode || schedule.room || 'TBA'}
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Section */}
+                      <div className="flex items-center gap-2">
+                        <Users className="w-4 h-4 text-gray-400" />
+                        <div>
+                          <p className="text-xs text-gray-500 dark:text-gray-400">Section</p>
+                          <p className="font-medium text-gray-900 dark:text-gray-100">
+                            {schedule.sectionCode || schedule.section || 'N/A'}
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Year & Program */}
+                      <div className="flex items-center gap-2">
+                        <GraduationCap className="w-4 h-4 text-gray-400" />
+                        <div>
+                          <p className="text-xs text-gray-500 dark:text-gray-400">Year & Program</p>
+                          <p className="font-medium text-gray-900 dark:text-gray-100">
+                            {schedule.yearLevel || 'N/A'} - {schedule.program || 'N/A'}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Additional Info */}
+                    <div className="flex items-center gap-4 mt-4 pt-4 border-t border-gray-100 dark:border-gray-700">
+                      <span className="text-xs px-2 py-1 bg-blue-100 text-blue-700 rounded-full dark:bg-blue-900/30 dark:text-blue-400">
+                        {schedule.subject?.units || 0} units
+                      </span>
+                      <span className="text-xs px-2 py-1 bg-green-100 text-green-700 rounded-full dark:bg-green-900/30 dark:text-green-400">
+                        Semester {schedule.semester || 1}
+                      </span>
+                      <span className="text-xs px-2 py-1 bg-purple-100 text-purple-700 rounded-full dark:bg-purple-900/30 dark:text-purple-400">
+                        AY {schedule.academicYear || 'N/A'}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Quick Stats */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+        <div className="bg-gray-50 rounded-xl shadow-sm border border-gray-200 p-6 dark:bg-gray-800 dark:border-gray-700">
+          <div className="flex items-center gap-3 mb-3">
+            <div className="p-2 bg-blue-100 rounded-lg dark:bg-blue-900/30">
+              <Calendar className="w-5 h-5 text-blue-600 dark:text-blue-400" />
+            </div>
+            <h3 className="font-semibold text-gray-900 dark:text-gray-100">Total Schedules</h3>
+          </div>
+          <p className="text-3xl font-bold text-gray-900 dark:text-gray-100">{allSchedules.length}</p>
+          <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">Active teaching schedules</p>
+        </div>
+
+        <div className="bg-gray-50 rounded-xl shadow-sm border border-gray-200 p-6 dark:bg-gray-800 dark:border-gray-700">
+          <div className="flex items-center gap-3 mb-3">
+            <div className="p-2 bg-green-100 rounded-lg dark:bg-green-900/30">
+              <Users className="w-5 h-5 text-green-600 dark:text-green-400" />
+            </div>
+            <h3 className="font-semibold text-gray-900 dark:text-gray-100">Class Spaces</h3>
+          </div>
+          <p className="text-3xl font-bold text-gray-900 dark:text-gray-100">{classes.length}</p>
+          <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">Active class spaces</p>
+          <button
+            onClick={() => window.location.href = '/classes'}
+            className="mt-3 text-sm text-green-600 hover:text-green-700 font-medium dark:text-green-400"
+          >
+            Manage Classes →
+          </button>
+        </div>
+
+        <div className="bg-gray-50 rounded-xl shadow-sm border border-gray-200 p-6 dark:bg-gray-800 dark:border-gray-700">
+          <div className="flex items-center gap-3 mb-3">
+            <div className="p-2 bg-orange-100 rounded-lg dark:bg-orange-900/30">
+              <Clock className="w-5 h-5 text-orange-600 dark:text-orange-400" />
+            </div>
+            <h3 className="font-semibold text-gray-900 dark:text-gray-100">This Week</h3>
+          </div>
+          <p className="text-3xl font-bold text-gray-900 dark:text-gray-100">
+            {allSchedules.reduce((total, schedule) => {
+              return total + (schedule.timeSlots?.length || 0);
+            }, 0)}
+          </p>
+          <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">Total class sessions</p>
+        </div>
+      </div>
+
+      {/* My Classes Section */}
+      <div className="bg-gray-50 rounded-xl shadow-sm border border-gray-200 p-6 dark:bg-gray-800 dark:border-gray-700">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
+            My Class Spaces
+          </h3>
+          <button
+            onClick={() => window.location.href = '/classes'}
+            className="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors text-sm font-medium"
+          >
+            View All Classes
+          </button>
+        </div>
+
+        {classes.length === 0 ? (
           <div className="text-center py-8 text-gray-500">
-            <Calendar className="w-12 h-12 mx-auto mb-2 text-gray-300" />
-            <p>No schedule available yet</p>
-            <p className="text-sm mt-1">Check back later for your class schedule</p>
+            <Users className="w-12 h-12 mx-auto mb-2 text-gray-300" />
+            <p>No class spaces assigned yet</p>
+            <p className="text-sm mt-1">Class spaces will appear here once schedules are created</p>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {classes.slice(0, 6).map((classSpace) => (
+              <div
+                key={classSpace._id}
+                onClick={() => window.location.href = '/classes'}
+                className="p-4 bg-gray-50 rounded-lg border border-gray-200 hover:border-indigo-400 cursor-pointer transition-all hover:shadow-md dark:bg-gray-700 dark:border-gray-600"
+              >
+                <div className="flex items-start justify-between mb-2">
+                  <div className="flex-1">
+                    <p className="font-semibold text-gray-900 dark:text-gray-100">
+                      {classSpace.subject?.subjectCode || classSpace.sectionCode}
+                    </p>
+                    {classSpace.subject?.subjectName && (
+                      <p className="text-sm text-gray-600 dark:text-gray-400 line-clamp-1 mt-1">
+                        {classSpace.subject.subjectName}
+                      </p>
+                    )}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 mt-3 text-xs">
+                  <span className="px-2 py-1 bg-indigo-100 text-indigo-700 rounded dark:bg-indigo-900/30 dark:text-indigo-400">
+                    {classSpace.sectionCode || 'N/A'}
+                  </span>
+                  <span className="text-gray-500 dark:text-gray-400">
+                    {classSpace.students?.length || 0} students
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+
+// Student Dashboard Component
+const StudentDashboard = ({ user, loading: parentLoading }) => {
+  const [studentData, setStudentData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [classes, setClasses] = useState([]);
+
+  useEffect(() => {
+    loadStudentData();
+  }, []);
+
+  const loadStudentData = async () => {
+    try {
+      // One call. /my-classes returns the student's own profile plus the class
+      // spaces they're enrolled in, each with its populated schedule.
+      //
+      // The previous version fetched EVERY student record and picked itself out
+      // client-side, then matched `schedule.section` ("A") against
+      // `sectionCode` ("BSIT-4A-D") - which never matched, so the schedule was
+      // always empty.
+      const response = await classSpaceAPI.getMyClasses();
+      const payload = response.data;
+
+      setStudentData(payload.profile || null);
+      setClasses(payload.data || []);
+    } catch (error) {
+      console.error('Failed to load student data:', error);
+      toast.error(
+        error.response?.data?.message || 'Failed to load your enrollment information'
+      );
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  /** "Monday 08:00-09:00" for the first meeting of a class. */
+  const describeSlots = (cs) => {
+    const slots = cs.schedule?.timeSlots || [];
+    if (slots.length === 0) return 'Schedule to be announced';
+    const first = `${slots[0].day} ${slots[0].startTime}-${slots[0].endTime}`;
+    return slots.length > 1 ? `${first} +${slots.length - 1} more` : first;
+  };
+
+  if (loading || parentLoading) {
+    return (
+      <div className="space-y-6 animate-pulse">
+        <div className="bg-gray-200 rounded-lg h-48"></div>
+        <div className="bg-gray-200 rounded-lg h-64"></div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Student Header - Simplified */}
+      <div className="mb-6 rounded-3xl bg-blue-900 px-8 py-7 text-white shadow-xl ring-1 ring-white/5">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="min-w-0">
+            <span className="inline-flex items-center gap-2 rounded-full border border-yellow-400/50 bg-yellow-400/20 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-yellow-100">
+              <GraduationCap size={14} />
+              CTU Daanbantayan Campus
+            </span>
+            <h1 className="mt-3 text-3xl font-bold">
+              Good day, {user?.firstName}
+            </h1>
+            <p className="mt-2 text-sm text-blue-200">
+              Real-time overview • {new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
+            </p>
+          </div>
+          <div className="p-3 bg-yellow-400/20 backdrop-blur-sm rounded-lg">
+            <GraduationCap className="w-10 h-10 text-yellow-400" />
+          </div>
+        </div>
+      </div>
+
+      {/* Enrollment Information - Below Header */}
+      {!studentData ? (
+        <div className="text-center py-6 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 shadow-sm">
+          <Users className="w-12 h-12 mx-auto mb-2 text-gray-400 dark:text-gray-500" />
+          <p className="text-gray-900 dark:text-white font-medium">No enrollment record found</p>
+          <p className="text-gray-600 dark:text-gray-400 text-sm mt-1">Please contact your program manager</p>
+        </div>
+      ) : studentData.studentType === 'regular' && !studentData.sectionCode ? (
+        <div className="text-center py-6 bg-orange-50 dark:bg-orange-900/20 rounded-lg border border-orange-200 dark:border-orange-800">
+          <AlertTriangle className="w-12 h-12 mx-auto mb-2 text-orange-500" />
+          <p className="font-medium text-gray-900 dark:text-white">Section Not Assigned</p>
+          <p className="text-gray-600 dark:text-gray-400 text-sm mt-1">Your program manager will assign you to a section soon</p>
+        </div>
+      ) : studentData.studentType === 'irregular' && (!studentData.subjectCodes || studentData.subjectCodes.length === 0) ? (
+        <div className="text-center py-6 bg-orange-50 dark:bg-orange-900/20 rounded-lg border border-orange-200 dark:border-orange-800">
+          <AlertTriangle className="w-12 h-12 mx-auto mb-2 text-orange-500" />
+          <p className="font-medium text-gray-900 dark:text-white">No Subjects Enrolled</p>
+          <p className="text-gray-600 dark:text-gray-400 text-sm mt-1">Your program manager will assign your subjects soon</p>
+        </div>
+      ) : (
+        <>
+          {/* Stat Cards Grid - Matching Program Manager Dashboard */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+            {/* Program Card */}
+            <div className="bg-white dark:bg-gray-800 rounded-xl p-6 border border-blue-200 dark:border-blue-700 shadow-sm">
+              <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-xl bg-white dark:bg-gray-700">
+                <BookOpen className="h-7 w-7 text-black dark:text-white" />
+              </div>
+              <div className="text-3xl font-bold text-black dark:text-white mb-2">
+                {user?.program || studentData?.program || 'N/A'}
+              </div>
+              <p className="text-xs font-semibold uppercase tracking-wider text-gray-600 dark:text-gray-400 mb-4">
+                Program
+              </p>
+              <span className="inline-block rounded-full bg-yellow-100 px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-blue-700 dark:bg-yellow-500/20 dark:text-yellow-300">
+                {studentData?.studentType || 'Regular'}
+              </span>
+            </div>
+
+            {/* Section/Subjects Card */}
+            <div className="bg-white dark:bg-gray-800 rounded-xl p-6 border border-blue-200 dark:border-blue-700 shadow-sm">
+              <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-xl bg-white dark:bg-gray-700">
+                <Users className="h-7 w-7 text-black dark:text-white" />
+              </div>
+              <div className="text-3xl font-bold text-black dark:text-white mb-2">
+                {studentData?.studentType === 'regular' 
+                  ? (studentData?.sectionCode || 'N/A')
+                  : (studentData?.subjectCodes?.length || 0)
+                }
+              </div>
+              <p className="text-xs font-semibold uppercase tracking-wider text-gray-600 dark:text-gray-400 mb-4">
+                {studentData?.studentType === 'regular' ? 'Section' : 'Enrolled Subjects'}
+              </p>
+              <span className="inline-block rounded-full bg-yellow-100 px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-blue-700 dark:bg-yellow-500/20 dark:text-yellow-300">
+                {studentData?.studentType === 'regular' ? 'Regular Student' : `${studentData?.subjectCodes?.length || 0} Subjects`}
+              </span>
+            </div>
+
+            {/* Academic Year Card */}
+            <div className="bg-white dark:bg-gray-800 rounded-xl p-6 border border-blue-200 dark:border-blue-700 shadow-sm">
+              <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-xl bg-white dark:bg-gray-700">
+                <Calendar className="h-7 w-7 text-black dark:text-white" />
+              </div>
+              <div className="text-3xl font-bold text-black dark:text-white mb-2">
+                {studentData.academicYear}
+              </div>
+              <p className="text-xs font-semibold uppercase tracking-wider text-gray-600 dark:text-gray-400 mb-4">
+                Academic Year
+              </p>
+              <span className="inline-block rounded-full bg-yellow-100 px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-blue-700 dark:bg-yellow-500/20 dark:text-yellow-300">
+                {studentData.semester === 1 ? '1st Semester' : '2nd Semester'}
+              </span>
+            </div>
+
+            {/* Enrollment Status Card */}
+            <div className="bg-white dark:bg-gray-800 rounded-xl p-6 border border-blue-200 dark:border-blue-700 shadow-sm">
+              <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-xl bg-white dark:bg-gray-700">
+                <CheckCircle className="h-7 w-7 text-black dark:text-white" />
+              </div>
+              <div className="text-3xl font-bold text-black dark:text-white mb-2 capitalize">
+                {studentData.enrollmentStatus || 'N/A'}
+              </div>
+              <p className="text-xs font-semibold uppercase tracking-wider text-gray-600 dark:text-gray-400 mb-4">
+                Enrollment Status
+              </p>
+              <span className={`inline-block rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-wide ${
+                studentData.enrollmentStatus === 'enrolled'
+                  ? 'bg-yellow-100 text-blue-700 dark:bg-yellow-500/20 dark:text-yellow-300'
+                  : 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400'
+              }`}>
+                {studentData.enrollmentStatus === 'enrolled' ? 'Active' : 'Inactive'}
+              </span>
+            </div>
+          </div>
+
+          {/* Enrolled Subjects - For Irregular Students */}
+          {studentData.studentType === 'irregular' && studentData.subjectCodes?.length > 0 && (
+            <div className="bg-white dark:bg-gray-800 rounded-xl p-6 border border-blue-200 dark:border-blue-700 shadow-sm">
+              <h3 className="text-sm font-semibold uppercase tracking-wider text-gray-600 dark:text-gray-400 mb-4">
+                Enrolled Subjects
+              </h3>
+              <div className="flex flex-wrap gap-2">
+                {studentData.subjectCodes.map((code, index) => (
+                  <span
+                    key={index}
+                    className="px-3 py-1.5 bg-yellow-100 text-blue-700 dark:bg-yellow-500/20 dark:text-yellow-300 rounded-full text-sm font-medium border border-yellow-200 dark:border-yellow-800"
+                  >
+                    {code}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* My Classes Enrollment */}
+      <MyClassesEnrollment />
+
+      {/* My Classes */}
+      <div className="bg-white rounded-xl shadow-sm border border-blue-200 p-6 dark:bg-gray-800 dark:border-blue-700">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-lg font-semibold text-black dark:text-white">
+            My Classes
+          </h3>
+          <button
+            onClick={() => window.location.href = '/classes'}
+            className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-sm font-medium"
+          >
+            Open Classes
+          </button>
+        </div>
+
+        {classes.length === 0 ? (
+          <div className="text-center py-8 text-gray-500 dark:text-gray-400">
+            <Calendar className="w-12 h-12 mx-auto mb-2 text-gray-300 dark:text-gray-600" />
+            <p>You have no classes yet</p>
+            <p className="text-sm mt-1">
+              {studentData?.studentType === 'irregular'
+                ? 'Join a subject with a class code from your instructor.'
+                : 'Join your section with the enrollment code from your program manager.'}
+            </p>
+            <button
+              onClick={() => window.location.href = '/classes'}
+              className="mt-4 px-4 py-2 bg-yellow-400 text-blue-900 rounded-lg hover:bg-yellow-500 transition-colors text-sm font-medium"
+            >
+              {studentData?.studentType === 'irregular' ? 'Join a Subject' : 'Join My Section'}
+            </button>
           </div>
         ) : (
           <div className="space-y-2">
             <p className="text-sm text-gray-600 dark:text-gray-400">
-              You have {schedules.length} scheduled {schedules.length === 1 ? 'class' : 'classes'}
+              You are enrolled in {classes.length} {classes.length === 1 ? 'class' : 'classes'}
             </p>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-4">
-              {schedules.slice(0, 4).map((schedule, index) => (
-                <div key={index} className="p-3 bg-gray-50 rounded-lg border border-gray-200 dark:bg-gray-700 dark:border-gray-600">
-                  <p className="font-medium text-gray-900 dark:text-gray-100">
-                    {typeof schedule.subject === 'object' ? schedule.subject.subjectName : schedule.subject}
-                  </p>
-                  <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-                    {schedule.day} • {schedule.timeSlot}
-                  </p>
-                </div>
-              ))}
+              {classes.slice(0, 4).map((cs) => {
+                const teacher = cs.faculty?.user
+                  ? `${cs.faculty.user.firstName || ''} ${cs.faculty.user.lastName || ''}`.trim()
+                  : null;
+                return (
+                  <div
+                    key={cs._id}
+                    onClick={() => window.location.href = '/classes'}
+                    className="p-3 bg-gray-50 rounded-lg border border-gray-200 hover:border-blue-400 cursor-pointer transition-colors dark:bg-gray-700 dark:border-gray-600"
+                  >
+                    <p className="font-medium text-gray-900 dark:text-gray-100">
+                      {cs.subject?.subjectCode || cs.sectionCode}
+                    </p>
+                    {cs.subject?.subjectName && (
+                      <p className="text-sm text-gray-600 dark:text-gray-400 line-clamp-1">
+                        {cs.subject.subjectName}
+                      </p>
+                    )}
+                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                      {describeSlots(cs)}
+                    </p>
+                    {teacher && (
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{teacher}</p>
+                    )}
+                    <div className="flex items-center gap-3 mt-2 text-xs text-gray-500 dark:text-gray-400">
+                      <span>{cs.announcements?.length || 0} announcements</span>
+                      <span>{cs.materials?.length || 0} materials</span>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
-            {schedules.length > 4 && (
+            {classes.length > 4 && (
               <p className="text-sm text-gray-500 text-center mt-3 dark:text-gray-400">
-                +{schedules.length - 4} more {schedules.length - 4 === 1 ? 'class' : 'classes'}
+                +{classes.length - 4} more {classes.length - 4 === 1 ? 'class' : 'classes'}
               </p>
             )}
           </div>
@@ -987,3 +1253,6 @@ const StudentDashboard = ({ user, loading: parentLoading }) => {
     </div>
   );
 };
+
+
+export default DashboardPage;

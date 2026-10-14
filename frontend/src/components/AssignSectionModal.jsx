@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { X, Users, CheckCircle, BookOpen } from 'lucide-react';
 import { studentAPI } from '../services/api';
 import toast from 'react-hot-toast';
+import { usePrograms } from '../hooks/usePrograms';
 
 const AssignSectionModal = ({ student, onClose, onSuccess }) => {
   const [formData, setFormData] = useState({
@@ -13,7 +14,7 @@ const AssignSectionModal = ({ student, onClose, onSuccess }) => {
   const [loading, setLoading] = useState(false);
   const [generatedCode, setGeneratedCode] = useState('');
 
-  const programs = ['BSIT', 'BSHM', 'BIT-ET', 'BIT-CT', 'BIT-AT', 'BSFI', 'BSIE'];
+  const { programCodes: programs } = usePrograms();
   const yearLevels = [1, 2, 3, 4];
   const sectionLetters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'];
 

@@ -8,6 +8,12 @@ const Student = require('../models/Student.model');
 const ClassSpace = require('../models/ClassSpace.model');
 const ActivityLog = require('../models/ActivityLog.model');
 const User = require('../models/User.model');
+const Program = require('../models/Program.model');
+const {
+  rankFacultyForSubject,
+  currentAcademicYearStart,
+  formatAcademicYear,
+} = require('../utils/teachingExperience');
 
 /**
  * Helper function to load comprehensive RAG context from database
@@ -16,7 +22,7 @@ const loadRAGContext = async () => {
   console.log('Loading comprehensive RAG context...');
   
   // Fetch ALL relevant data for deep knowledge
-  const [subjects, faculty, rooms, schedules, sections, students, classSpaces, users] = await Promise.all([
+  const [subjects, faculty, rooms, schedules, sections, students, classSpaces, users, programs] = await Promise.all([
     // Subjects with full details
     Subject.find()
       .select('subjectCode subjectName description units lectureHours labHours program yearLevel semester prerequisite')
@@ -64,6 +70,12 @@ const loadRAGContext = async () => {
     // Users (for authentication and role management)
     User.find()
       .select('firstName lastName email role program department isActive createdAt')
+      .lean(),
+
+    // Programs (the authoritative list of program codes/names)
+    Program.find({ isActive: true })
+      .select('code name description department duration')
+      .sort({ code: 1 })
       .lean()
   ]);
 
@@ -143,6 +155,7 @@ const loadRAGContext = async () => {
     students: students || [],
     classSpaces: classSpaces || [],
     users: users || [],
+    programs: programs || [],
     stats: {
       totalSubjects: subjects.length,
       totalFaculty: faculty.length,
@@ -152,12 +165,13 @@ const loadRAGContext = async () => {
       totalStudents: students.length,
       totalClassSpaces: classSpaces.length,
       totalUsers: users.length,
+      totalPrograms: programs.length,
       scheduleStats,
       studentStats
     }
   };
 
-  console.log(`RAG Context loaded: ${subjects.length} subjects, ${faculty.length} faculty, ${rooms.length} rooms, ${schedules.length} schedules, ${sections.length} sections, ${students.length} students, ${classSpaces.length} classSpaces, ${users.length} users`);
+  console.log(`RAG Context loaded: ${programs.length} programs, ${subjects.length} subjects, ${faculty.length} faculty, ${rooms.length} rooms, ${schedules.length} schedules, ${sections.length} sections, ${students.length} students, ${classSpaces.length} classSpaces, ${users.length} users`);
   
   return context;
 };
@@ -195,25 +209,72 @@ exports.recommendFacultyForSubject = async (req, res) => {
       });
     }
 
-    // Use Gemini service to get recommendations
-    const result = await geminiService.recommendFacultyForSubject(subject._id);
+    // Only consider faculty qualified for this subject's program.
+    // 'General' subjects are open to everyone.
+    const facultyQuery = { isActive: true };
+    if (subject.program && subject.program !== 'General') {
+      facultyQuery.$or = [
+        { programs: subject.program },
+        { 'teachingHistory.program': subject.program },
+      ];
+    }
 
-    if (result.success) {
+    const candidates = await Faculty.find(facultyQuery)
+      .populate('user', 'firstName lastName email')
+      .lean();
+
+    // Rank by recency-weighted experience with this exact subject.
+    // Recent experience outranks older experience - see utils/teachingExperience.js
+    const ranked = rankFacultyForSubject(candidates, subject, {
+      onlyWithCapacity: false,
+    }).slice(0, 10);
+
+    if (ranked.length === 0) {
       return res.status(200).json({
         success: true,
-        subject: { 
-          code: subject.subjectCode, 
-          name: subject.subjectName 
-        },
-        message: result.message,
-        recommendations: result.recommendations,
-      });
-    } else {
-      return res.status(500).json({
-        success: false,
-        message: result.message,
+        subject: { code: subject.subjectCode, name: subject.subjectName },
+        message: `No faculty are currently qualified for ${subject.program}.`,
+        recommendations: [],
       });
     }
+
+    const experienced = ranked.filter(r => r.experience.timesTaught > 0);
+
+    return res.status(200).json({
+      success: true,
+      subject: {
+        code: subject.subjectCode,
+        name: subject.subjectName,
+        program: subject.program,
+        units: subject.units,
+      },
+      currentAcademicYear: formatAcademicYear(currentAcademicYearStart()),
+      message: experienced.length > 0
+        ? `${experienced.length} of ${ranked.length} candidates have taught ${subject.subjectCode} before. Ranked by how recently and how often they taught it.`
+        : `No faculty have taught ${subject.subjectCode} before. Ranked by specialization, workload, and qualifications.`,
+      recommendations: ranked.map((r, idx) => ({
+        rank: idx + 1,
+        facultyId: r.faculty._id,
+        employeeId: r.faculty.employeeId,
+        name: `${r.faculty.user?.firstName || ''} ${r.faculty.user?.lastName || ''}`.trim(),
+        position: r.faculty.position,
+        employmentType: r.faculty.employmentType,
+        score: r.score,
+        breakdown: r.breakdown,
+        reason: r.reason,
+        hasCapacity: r.hasCapacity,
+        availableLoad: r.availableLoad,
+        // The teaching-history detail the ranking is based on
+        timesTaught: r.experience.timesTaught,
+        lastTaughtAcademicYear: r.experience.lastTaughtAcademicYear,
+        lastTaughtYearsAgo: r.experience.lastTaughtYearsAgo,
+        firstTaughtAcademicYear: r.experience.firstTaughtAcademicYear,
+        experienceIsDated: r.experience.isStale,
+        weightedExperience: Math.round(r.experience.weightedExperience * 100) / 100,
+        subjectRating: r.experience.avgRating,
+        occurrences: r.experience.occurrences,
+      })),
+    });
   } catch (error) {
     console.error('Faculty Recommendation Error:', error);
     return res.status(500).json({

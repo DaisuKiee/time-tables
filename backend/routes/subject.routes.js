@@ -10,10 +10,12 @@ const {
   getSubjectsByProgramAndYear,
   getSubjectStats,
   bulkImportSubjects,
-  getSubjectsByQualification
+  getSubjectsByQualification,
+  generateSubjectCode
 } = require('../controllers/subject.controller');
 const { protect, authorize } = require('../middleware/auth.middleware');
 const { checkProgramAccess } = require('../middleware/programAccess.middleware');
+const { isValidProgramCode } = require('../utils/programValidator');
 
 // Validation middleware
 const createSubjectValidation = [
@@ -34,8 +36,14 @@ const createSubjectValidation = [
     .isInt({ min: 0 })
     .withMessage('Lecture hours must be a positive number'),
   body('program')
-    .isIn(['BSIT', 'BSHM', 'BIT-ET', 'BIT-CT', 'BIT-AT', 'BSFI', 'BSIE', 'General'])
-    .withMessage('Invalid program'),
+    .custom(async (value) => {
+      // 'General' covers subjects shared across every program
+      const valid = await isValidProgramCode(value, ['General']);
+      if (!valid) {
+        throw new Error(`'${value}' is not an active program in the database`);
+      }
+      return true;
+    }),
   body('yearLevel')
     .isInt({ min: 1, max: 4 })
     .withMessage('Year level must be between 1 and 4'),
@@ -53,6 +61,9 @@ router.get('/stats', checkProgramAccess('Subject'), getSubjectStats);
 router.get('/curriculum/:program/:yearLevel', getSubjectsByProgramAndYear);
 router.get('/qualification/:qualification', getSubjectsByQualification);
 router.get('/:id', checkProgramAccess('Subject'), getSubjectById);
+
+// Generate subject code endpoint
+router.post('/generate-code', authorize('admin', 'scheduling_officer', 'program_manager'), generateSubjectCode);
 
 // Apply program access control for create/update/delete operations
 // Admin/Scheduling Officer/Program Manager routes
